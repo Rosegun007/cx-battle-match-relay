@@ -1,23 +1,29 @@
-# CX对战 Cloudflare 联机握手/转发服务器 S0002
+# CX对战 Cloudflare 联机握手/转发服务器 S0003
 
-S0002 在 S0001 的配对/建房/转发逻辑基础上，只增加诊断能力，不增加服务器端游戏合法性校验。
+## S0003 新增
 
-新增：
-- `/health` 返回 `serviceVersion: "S0002"`。
-- 每次连接有 `sessionId`。
-- `deploy` 被服务器接收并编号后，发起端会额外收到 `deploy_ack`。
-- 所有 WebSocket 消息总入口有 try/catch；单条消息处理异常会返回 `server_error`，尽量不让整个连接因未捕获异常中断。
-- Cloudflare Workers Logs 中记录：连接、排队、配对、deploy、广播数量、close code/reason/wasClean、异常。
-- `webSocketError` 只记日志，房间清理由 `webSocketClose` 单一路径完成，避免重复清理。
+- 30 秒短时断线恢复宽限。
+- 任意一方异常断线后，房间进入 suspended，另一方收到 `peer_reconnecting`，双方客户端应暂停。
+- 匹配时为 blue/red 各自发放独立 `resumeToken`。
+- 掉线方新 WebSocket 连接后发送 `resume_match`，可重新绑定原房间和原阵营。
+- 双方都在线后服务器发送 `resume_ready`：约 2.5 秒后从共同安全 `resumeTick` 继续。
+- 客户端在每个新的整秒确定性快照产生后发送一次 `sync_heartbeat`，服务器记录 `tick / checkpointTick / lastServerSeq`；避免对同一恢复点重复写存储。
+- 恢复点使用双方最近确认的整秒回放快照 Tick 中较小者。
+- 房间的正式 `deploy_event` 事件表持久化到 Durable Object Storage；恢复时一并下发，客户端可回滚后重新排入尚未执行的部署。
+- 30 秒仍未恢复则通过 Durable Object Alarm 清理房间，在线方收到 `resume_timeout`。
+- 主动 `leave_room` / 正常重开不会误触发 30 秒恢复。
 
-## 从 S0001 更新（纯浏览器）
-1. 解压本 ZIP。
-2. 在 GitHub 仓库 `cx-battle-match-relay` 中选择 **Add file → Upload files**。
-3. 把解压后的 `src` 文件夹、`package.json`、`wrangler.jsonc`、本 README 拖进去，覆盖同名文件。
+## 浏览器部署
+
+继续使用原 GitHub 仓库 `cx-battle-match-relay`：
+
+1. 解压 S0003 ZIP。
+2. GitHub 仓库 → Add file → Upload files。
+3. 上传并覆盖：`src/`、`package.json`、`wrangler.jsonc`、`README_浏览器部署.md`。
 4. Commit changes 到 `main`。
-5. Cloudflare 已连接 GitHub，应自动触发部署，无需在 Windows 安装 Node/Wrangler。
-6. 部署结束后访问：
+5. Cloudflare 已连接 GitHub 时会自动部署。
+6. 部署后访问：
    `https://cx-battle-match-relay.rosegun-chen.workers.dev/health`
-   应看到 `"serviceVersion": "S0002"`。
+7. 确认返回 `"serviceVersion": "S0003"`。
 
-注意：Durable Object 类名和 migration 没变，仍使用原 v1 migration；不要新建第二个 Durable Object。
+`wrangler.jsonc` 的 Durable Object 类和 migration 不需要新增或手工修改；S0003 继续复用既有 `CXMatchHub` SQLite-backed Durable Object。

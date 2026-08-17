@@ -1,10 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 
 const PROTOCOL_VERSION = 1;
-const SERVICE_VERSION = "S0002";
+const SERVICE_VERSION = "S0003";
 const MATCH_START_DELAY_MS = 5000;
 const RELAY_DELAY_MS = 150;
+const RECONNECT_GRACE_MS = 30000;
+const RESUME_START_DELAY_MS = 2500;
+const MAX_ROOM_EVENTS = 512;
 const HUB_NAME = "cx-global-match-hub-v1";
+const ROOM_PREFIX = "room:";
+const INTENTIONAL_CLOSE_REASONS = new Set(["user", "manual", "rematch", "record-playback", "match-finished"]);
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -23,6 +28,14 @@ function errorText(error) {
   return String(error.stack || error.message || error);
 }
 
+function roomKey(roomId) {
+  return `${ROOM_PREFIX}${roomId}`;
+}
+
+function newResumeToken() {
+  return `${crypto.randomUUID()}-${crypto.randomUUID()}`;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -33,6 +46,7 @@ export default {
         service: "cx-battle-match-relay",
         serviceVersion: SERVICE_VERSION,
         protocol: PROTOCOL_VERSION,
+        reconnectGraceMs: RECONNECT_GRACE_MS,
         serverNow: Date.now(),
       });
     }
@@ -51,7 +65,7 @@ export default {
         return await stub.fetch(request);
       } catch (error) {
         const errorId = crypto.randomUUID();
-        console.error("[CX:S0002][worker->durable]", errorId, errorText(error));
+        console.error(`[CX:${SERVICE_VERSION}][worker->durable]`, errorId, errorText(error));
         return json({
           ok: false,
           service: "cx-battle-match-relay",
@@ -67,6 +81,7 @@ export default {
       service: "cx-battle-match-relay",
       serviceVersion: SERVICE_VERSION,
       protocol: PROTOCOL_VERSION,
+      reconnectGraceMs: RECONNECT_GRACE_MS,
       endpoints: { health: "/health", websocket: "/ws" },
     });
   },
@@ -111,6 +126,7 @@ export class CXMatchHub extends DurableObject {
       connectedAt: Date.now(),
       lastMessageAt: null,
       lastClientSeq: null,
+      resumedFromSessionId: null,
     };
 
     this.setSession(server, session);
@@ -119,6 +135,7 @@ export class CXMatchHub extends DurableObject {
       protocol: PROTOCOL_VERSION,
       serviceVersion: SERVICE_VERSION,
       sessionId: session.sessionId,
+      reconnectGraceMs: RECONNECT_GRACE_MS,
       serverNow: Date.now(),
     }, "connected");
 
@@ -173,8 +190,17 @@ export class CXMatchHub extends DurableObject {
         case "leave_queue":
           this.handleLeaveQueue(ws, session);
           break;
+        case "leave_room":
+          await this.handleLeaveRoom(ws, session, data.reason || "client_leave");
+          break;
         case "deploy":
           await this.handleDeploy(ws, session, data);
+          break;
+        case "sync_heartbeat":
+          await this.handleSyncHeartbeat(ws, session, data);
+          break;
+        case "resume_match":
+          await this.handleResumeMatch(ws, session, data);
           break;
         case "ping":
           this.send(ws, {
@@ -238,7 +264,22 @@ export class CXMatchHub extends DurableObject {
       detail: errorText(error),
       serverNow: Date.now(),
     });
-    // 不在 error 回调中重复清理；close 回调负责唯一的房间清理路径。
+  }
+
+  async alarm() {
+    try {
+      const now = Date.now();
+      const rooms = await this.ctx.storage.list({ prefix: ROOM_PREFIX });
+      for (const [key, room] of rooms.entries()) {
+        if (!room?.suspended || !Number.isFinite(room.graceDeadline) || room.graceDeadline > now) continue;
+        await this.expireSuspendedRoom(room, "resume_timeout");
+        await this.ctx.storage.delete(key);
+      }
+      await this.scheduleNextGraceAlarm();
+    } catch (error) {
+      console.error(`[CX:${SERVICE_VERSION}] alarm error`, errorText(error));
+      try { await this.ctx.storage.setAlarm(Date.now() + 5000); } catch (_) {}
+    }
   }
 
   async handleJoinQueue(ws, session, data) {
@@ -315,6 +356,45 @@ export class CXMatchHub extends DurableObject {
       const roomId = `CX_${String(roomNo).padStart(6, "0")}_${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
       const serverNow = Date.now();
       const startAt = serverNow + MATCH_START_DELAY_MS;
+      const blueResumeToken = newResumeToken();
+      const redResumeToken = newResumeToken();
+
+      const room = {
+        roomId,
+        createdAt: serverNow,
+        startAt,
+        nextServerSeq: 0,
+        events: [],
+        suspended: false,
+        pauseTick: null,
+        graceDeadline: null,
+        resumingUntil: null,
+        seats: {
+          blue: {
+            resumeToken: blueResumeToken,
+            sessionId: blueSession.sessionId,
+            connected: true,
+            ruleVersion: blueSession.ruleVersion ?? null,
+            clientId: blueSession.clientId ?? null,
+            lastTick: 0,
+            lastCheckpointTick: 0,
+            lastServerSeq: 0,
+            lastSeenAt: serverNow,
+          },
+          red: {
+            resumeToken: redResumeToken,
+            sessionId: redSession.sessionId,
+            connected: true,
+            ruleVersion: redSession.ruleVersion ?? null,
+            clientId: redSession.clientId ?? null,
+            lastTick: 0,
+            lastCheckpointTick: 0,
+            lastServerSeq: 0,
+            lastSeenAt: serverNow,
+          },
+        },
+      };
+      await this.ctx.storage.put(roomKey(roomId), room);
 
       const blueNext = {
         ...blueSession,
@@ -343,12 +423,14 @@ export class CXMatchHub extends DurableObject {
         roomId,
         serverNow,
         startAt,
+        reconnectGraceMs: RECONNECT_GRACE_MS,
       };
 
       this.send(blueWs, {
         ...common,
         seat: 1,
         team: "blue",
+        resumeToken: blueResumeToken,
         opponentRuleVersion: redSession.ruleVersion ?? null,
       }, "match_found_blue");
 
@@ -356,6 +438,7 @@ export class CXMatchHub extends DurableObject {
         ...common,
         seat: 2,
         team: "red",
+        resumeToken: redResumeToken,
         opponentRuleVersion: blueSession.ruleVersion ?? null,
       }, "match_found_red");
 
@@ -374,35 +457,31 @@ export class CXMatchHub extends DurableObject {
       return;
     }
 
-    const roomId = session.roomId;
+    const key = roomKey(session.roomId);
+    let room = await this.ctx.storage.get(key);
+    if (!room) {
+      this.sendError(ws, "room_missing", "房间已不存在，请重新匹配。");
+      return;
+    }
+    if (room.suspended) {
+      this.sendError(ws, "room_suspended", "当前房间因短时断线暂停，恢复完成前不能部署。");
+      return;
+    }
+    if (Number.isFinite(room.resumingUntil) && Date.now() < room.resumingUntil) {
+      this.sendError(ws, "resume_countdown", "房间正在恢复倒计时，暂不能部署。");
+      return;
+    }
+
     const clientSeq = data.clientSeq ?? null;
-    const serverSeq = await this.nextCounter(`roomSeq:${roomId}`);
     const serverReceivedAt = Date.now();
     const applyAt = serverReceivedAt + RELAY_DELAY_MS;
-
-    const nextSession = { ...session, lastClientSeq: clientSeq };
-    this.setSession(ws, nextSession);
-
-    // S0002：明确给发起端一个 ACK。它只是证明“服务器已接收并编号”，
-    // 不代表服务器已校验该部署是否合法；第一阶段仍完全不做游戏规则校验。
-    this.send(ws, {
-      op: "deploy_ack",
-      protocol: PROTOCOL_VERSION,
-      serviceVersion: SERVICE_VERSION,
-      roomId,
-      team: session.team,
-      clientSeq,
-      serverSeq,
-      serverReceivedAt,
-      applyAt,
-      serverNow: Date.now(),
-    }, "deploy_ack");
+    const serverSeq = (Number(room.nextServerSeq) || 0) + 1;
 
     const event = {
       op: "deploy_event",
       protocol: PROTOCOL_VERSION,
       serviceVersion: SERVICE_VERSION,
-      roomId,
+      roomId: session.roomId,
       serverSeq,
       team: session.team,
       clientSeq,
@@ -411,10 +490,35 @@ export class CXMatchHub extends DurableObject {
       action: data.action ?? null,
     };
 
-    const delivered = this.broadcastRoom(roomId, event);
+    room.nextServerSeq = serverSeq;
+    room.events = [...(Array.isArray(room.events) ? room.events : []), event].slice(-MAX_ROOM_EVENTS);
+    const seat = room.seats?.[session.team];
+    if (seat) {
+      seat.lastServerSeq = Math.max(Number(seat.lastServerSeq) || 0, serverSeq);
+      seat.lastSeenAt = serverReceivedAt;
+    }
+    await this.ctx.storage.put(key, room);
+
+    const nextSession = { ...session, lastClientSeq: clientSeq };
+    this.setSession(ws, nextSession);
+
+    this.send(ws, {
+      op: "deploy_ack",
+      protocol: PROTOCOL_VERSION,
+      serviceVersion: SERVICE_VERSION,
+      roomId: session.roomId,
+      team: session.team,
+      clientSeq,
+      serverSeq,
+      serverReceivedAt,
+      applyAt,
+      serverNow: Date.now(),
+    }, "deploy_ack");
+
+    const delivered = this.broadcastRoom(session.roomId, event);
 
     console.log(`[CX:${SERVICE_VERSION}] deploy relayed`, {
-      roomId,
+      roomId: session.roomId,
       team: session.team,
       clientSeq,
       serverSeq,
@@ -425,40 +529,286 @@ export class CXMatchHub extends DurableObject {
     });
   }
 
+  async handleSyncHeartbeat(ws, session, data) {
+    if (session.status !== "matched" || !session.roomId || !session.team) return;
+    const key = roomKey(session.roomId);
+    const room = await this.ctx.storage.get(key);
+    if (!room?.seats?.[session.team]) return;
+    const seat = room.seats[session.team];
+    seat.connected = true;
+    seat.sessionId = session.sessionId;
+    seat.lastTick = Math.max(0, Math.floor(Number(data.tick) || 0));
+    seat.lastCheckpointTick = Math.max(0, Math.floor(Number(data.checkpointTick) || 0));
+    seat.lastServerSeq = Math.max(0, Math.floor(Number(data.lastServerSeq) || 0));
+    seat.lastSeenAt = Date.now();
+    await this.ctx.storage.put(key, room);
+  }
+
+  async handleResumeMatch(ws, session, data) {
+    const roomId = String(data.roomId || "");
+    const resumeToken = String(data.resumeToken || "");
+    if (!roomId || !resumeToken) {
+      this.sendError(ws, "bad_resume_request", "恢复请求缺少 roomId 或 resumeToken。");
+      return;
+    }
+
+    const key = roomKey(roomId);
+    const room = await this.ctx.storage.get(key);
+    if (!room) {
+      this.send(ws, { op: "resume_rejected", code: "room_missing", roomId, serverNow: Date.now() }, "resume_rejected");
+      return;
+    }
+    if (!room.suspended || !Number.isFinite(room.graceDeadline)) {
+      this.send(ws, { op: "resume_rejected", code: "room_not_suspended", roomId, serverNow: Date.now() }, "resume_rejected");
+      return;
+    }
+    if (Date.now() > room.graceDeadline) {
+      await this.expireSuspendedRoom(room, "resume_timeout");
+      await this.ctx.storage.delete(key);
+      await this.scheduleNextGraceAlarm();
+      this.send(ws, { op: "resume_rejected", code: "resume_timeout", roomId, serverNow: Date.now() }, "resume_rejected");
+      return;
+    }
+
+    let team = null;
+    if (room.seats?.blue?.resumeToken === resumeToken) team = "blue";
+    else if (room.seats?.red?.resumeToken === resumeToken) team = "red";
+    if (!team) {
+      this.send(ws, { op: "resume_rejected", code: "bad_resume_token", roomId, serverNow: Date.now() }, "resume_rejected");
+      return;
+    }
+
+    const seat = room.seats[team];
+    const oldSessionId = seat.sessionId;
+    seat.connected = true;
+    seat.sessionId = session.sessionId;
+    seat.lastSeenAt = Date.now();
+    seat.lastTick = Math.max(Number(seat.lastTick) || 0, Math.floor(Number(data.localTick) || 0));
+    seat.lastCheckpointTick = Math.max(Number(seat.lastCheckpointTick) || 0, Math.floor(Number(data.checkpointTick) || 0));
+    seat.lastServerSeq = Math.max(Number(seat.lastServerSeq) || 0, Math.floor(Number(data.lastServerSeq) || 0));
+
+    const opponentTeam = team === "blue" ? "red" : "blue";
+    const opponentSeat = room.seats[opponentTeam];
+    const nextSession = {
+      ...session,
+      clientId: seat.clientId || session.clientId,
+      ruleVersion: seat.ruleVersion || session.ruleVersion,
+      status: "matched",
+      roomId,
+      team,
+      peerSessionId: opponentSeat?.sessionId || null,
+      startAt: room.startAt,
+      resumedFromSessionId: oldSessionId || null,
+    };
+    this.setSession(ws, nextSession);
+
+    const opponentEntry = this.findConnectedSeat(roomId, opponentTeam);
+    if (opponentEntry) {
+      const [opponentWs, opponentSession] = opponentEntry;
+      this.setSession(opponentWs, { ...opponentSession, peerSessionId: session.sessionId });
+    }
+
+    await this.ctx.storage.put(key, room);
+
+    console.log(`[CX:${SERVICE_VERSION}] resume seat rebound`, {
+      roomId,
+      team,
+      oldSessionId,
+      newSessionId: session.sessionId,
+      opponentConnected: !!opponentEntry,
+      pauseTick: room.pauseTick,
+      graceDeadline: room.graceDeadline,
+    });
+
+    if (!opponentEntry) {
+      this.send(ws, {
+        op: "resume_waiting",
+        protocol: PROTOCOL_VERSION,
+        serviceVersion: SERVICE_VERSION,
+        roomId,
+        team,
+        pauseTick: Math.max(0, Math.floor(Number(room.pauseTick) || 0)),
+        graceDeadline: room.graceDeadline,
+        serverNow: Date.now(),
+      }, "resume_waiting");
+      return;
+    }
+
+    await this.completeRoomResume(room);
+  }
+
+  async completeRoomResume(room) {
+    const roomId = room.roomId;
+    const blueEntry = this.findConnectedSeat(roomId, "blue");
+    const redEntry = this.findConnectedSeat(roomId, "red");
+    if (!blueEntry || !redEntry) return;
+
+    const resumeTick = Math.max(0, Math.floor(Number(room.pauseTick) || 0));
+    const resumeAt = Date.now() + RESUME_START_DELAY_MS;
+    room.suspended = false;
+    room.graceDeadline = null;
+    room.resumingUntil = resumeAt;
+    room.pauseTick = resumeTick;
+    for (const team of ["blue", "red"]) {
+      if (room.seats?.[team]) {
+        room.seats[team].connected = true;
+        room.seats[team].lastTick = resumeTick;
+        room.seats[team].lastCheckpointTick = resumeTick;
+        room.seats[team].lastSeenAt = Date.now();
+      }
+    }
+    await this.ctx.storage.put(roomKey(roomId), room);
+    await this.scheduleNextGraceAlarm();
+
+    const payload = {
+      op: "resume_ready",
+      protocol: PROTOCOL_VERSION,
+      serviceVersion: SERVICE_VERSION,
+      roomId,
+      resumeTick,
+      resumeAt,
+      originalStartAt: room.startAt,
+      lastServerSeq: Number(room.nextServerSeq) || 0,
+      events: Array.isArray(room.events) ? room.events : [],
+      serverNow: Date.now(),
+    };
+    this.send(blueEntry[0], { ...payload, team: "blue" }, "resume_ready_blue");
+    this.send(redEntry[0], { ...payload, team: "red" }, "resume_ready_red");
+
+    console.log(`[CX:${SERVICE_VERSION}] room resume ready`, {
+      roomId,
+      resumeTick,
+      resumeAt,
+      eventCount: payload.events.length,
+      lastServerSeq: payload.lastServerSeq,
+    });
+  }
+
+  async handleLeaveRoom(ws, session, reason = "client_leave") {
+    if (session.status !== "matched" || !session.roomId) return;
+    const room = await this.ctx.storage.get(roomKey(session.roomId));
+    if (room) {
+      await this.terminateRoom(room, "room_closed", reason);
+      await this.ctx.storage.delete(roomKey(room.roomId));
+      await this.scheduleNextGraceAlarm();
+    }
+    const current = this.sessions.get(ws) || session;
+    this.setSession(ws, this.idleSession(current));
+  }
+
   async handleDisconnect(ws, code, reason, wasClean = false) {
     const session = this.sessions.get(ws) || ws.deserializeAttachment();
     this.sessions.delete(ws);
     if (!session) return;
 
-    if (session.status === "matched" && session.roomId) {
-      for (const [peerWs, peerSession] of this.sessions.entries()) {
-        if (peerSession?.roomId !== session.roomId) continue;
-        if (peerSession.sessionId !== session.peerSessionId) continue;
+    if (session.status !== "matched" || !session.roomId || !session.team) return;
 
-        this.send(peerWs, {
-          op: "opponent_left",
-          protocol: PROTOCOL_VERSION,
-          serviceVersion: SERVICE_VERSION,
-          roomId: session.roomId,
-          code,
-          reason,
-          wasClean,
-          serverNow: Date.now(),
-        }, "opponent_left");
+    const room = await this.ctx.storage.get(roomKey(session.roomId));
+    if (!room) return;
 
-        this.setSession(peerWs, {
-          ...peerSession,
-          status: "idle",
-          queueOrder: null,
-          queuedAt: null,
-          roomId: null,
-          team: null,
-          peerSessionId: null,
-          startAt: null,
-        });
-        break;
-      }
+    if (code === 1000 && INTENTIONAL_CLOSE_REASONS.has(String(reason || ""))) {
+      await this.terminateRoom(room, "room_closed", reason || "intentional_close");
+      await this.ctx.storage.delete(roomKey(room.roomId));
+      await this.scheduleNextGraceAlarm();
+      return;
     }
+
+    const seat = room.seats?.[session.team];
+    if (seat) {
+      seat.connected = false;
+      seat.sessionId = null;
+      seat.lastSeenAt = Date.now();
+    }
+
+    if (!room.suspended) {
+      const blueCheckpoint = Math.max(0, Math.floor(Number(room.seats?.blue?.lastCheckpointTick) || 0));
+      const redCheckpoint = Math.max(0, Math.floor(Number(room.seats?.red?.lastCheckpointTick) || 0));
+      room.suspended = true;
+      room.pauseTick = Math.min(blueCheckpoint, redCheckpoint);
+      room.graceDeadline = Date.now() + RECONNECT_GRACE_MS;
+      room.resumingUntil = null;
+    }
+    await this.ctx.storage.put(roomKey(room.roomId), room);
+    await this.scheduleNextGraceAlarm();
+
+    for (const [peerWs, peerSession] of this.sessions.entries()) {
+      if (peerSession?.status !== "matched" || peerSession.roomId !== room.roomId) continue;
+      this.send(peerWs, {
+        op: "peer_reconnecting",
+        protocol: PROTOCOL_VERSION,
+        serviceVersion: SERVICE_VERSION,
+        roomId: room.roomId,
+        disconnectedTeam: session.team,
+        pauseTick: Math.max(0, Math.floor(Number(room.pauseTick) || 0)),
+        graceDeadline: room.graceDeadline,
+        code,
+        reason,
+        wasClean,
+        serverNow: Date.now(),
+      }, "peer_reconnecting");
+    }
+
+    console.log(`[CX:${SERVICE_VERSION}] room suspended`, {
+      roomId: room.roomId,
+      disconnectedTeam: session.team,
+      pauseTick: room.pauseTick,
+      graceDeadline: room.graceDeadline,
+      code,
+      reason,
+      wasClean,
+    });
+  }
+
+  async expireSuspendedRoom(room, reason = "resume_timeout") {
+    for (const [ws, session] of [...this.sessions.entries()]) {
+      if (session?.status !== "matched" || session.roomId !== room.roomId) continue;
+      this.send(ws, {
+        op: "resume_timeout",
+        protocol: PROTOCOL_VERSION,
+        serviceVersion: SERVICE_VERSION,
+        roomId: room.roomId,
+        reason,
+        serverNow: Date.now(),
+      }, "resume_timeout");
+      this.setSession(ws, this.idleSession(session));
+    }
+    console.log(`[CX:${SERVICE_VERSION}] room resume timeout`, { roomId: room.roomId, reason, serverNow: Date.now() });
+  }
+
+  async terminateRoom(room, op = "room_closed", reason = "closed") {
+    for (const [ws, session] of [...this.sessions.entries()]) {
+      if (session?.status !== "matched" || session.roomId !== room.roomId) continue;
+      this.send(ws, {
+        op,
+        protocol: PROTOCOL_VERSION,
+        serviceVersion: SERVICE_VERSION,
+        roomId: room.roomId,
+        reason,
+        serverNow: Date.now(),
+      }, op);
+      this.setSession(ws, this.idleSession(session));
+    }
+  }
+
+  idleSession(session) {
+    return {
+      ...session,
+      status: "idle",
+      queueOrder: null,
+      queuedAt: null,
+      roomId: null,
+      team: null,
+      peerSessionId: null,
+      startAt: null,
+      resumedFromSessionId: null,
+    };
+  }
+
+  findConnectedSeat(roomId, team) {
+    for (const [ws, session] of this.sessions.entries()) {
+      if (session?.status === "matched" && session.roomId === roomId && session.team === team && ws.readyState === WebSocket.OPEN) return [ws, session];
+    }
+    return null;
   }
 
   broadcastRoom(roomId, payload) {
@@ -511,5 +861,15 @@ export class CXMatchHub extends DurableObject {
     const next = current + 1;
     await this.ctx.storage.put(key, next);
     return next;
+  }
+
+  async scheduleNextGraceAlarm() {
+    const rooms = await this.ctx.storage.list({ prefix: ROOM_PREFIX });
+    let earliest = Infinity;
+    for (const room of rooms.values()) {
+      if (room?.suspended && Number.isFinite(room.graceDeadline)) earliest = Math.min(earliest, room.graceDeadline);
+    }
+    if (Number.isFinite(earliest)) await this.ctx.storage.setAlarm(earliest);
+    else await this.ctx.storage.deleteAlarm();
   }
 }
