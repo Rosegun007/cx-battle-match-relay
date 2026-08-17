@@ -1,9 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 
 const PROTOCOL_VERSION = 1;
-const SERVICE_VERSION = "S0003";
+const SERVICE_VERSION = "S0004";
 const MATCH_START_DELAY_MS = 5000;
 const RELAY_DELAY_MS = 150;
+const SIM_STEP_MS = 1000 / 60;
 const RECONNECT_GRACE_MS = 30000;
 const RESUME_START_DELAY_MS = 2500;
 const MAX_ROOM_EVENTS = 512;
@@ -34,6 +35,33 @@ function roomKey(roomId) {
 
 function newResumeToken() {
   return `${crypto.randomUUID()}-${crypto.randomUUID()}`;
+}
+
+function roomClockEpoch(room) {
+  const hasStored = Number.isFinite(Number(room?.clockBaseServerAt));
+  if (hasStored) {
+    return {
+      baseTick: Math.max(0, Math.floor(Number(room.clockBaseTick) || 0)),
+      baseServerAt: Number(room.clockBaseServerAt),
+    };
+  }
+  // S0003活动房间平滑升级兼容：若已经发生过一次恢复，resumingUntil就是当次resumeAt。
+  if (Number.isFinite(Number(room?.resumingUntil)) && Number.isFinite(Number(room?.pauseTick))) {
+    return {
+      baseTick: Math.max(0, Math.floor(Number(room.pauseTick) || 0)),
+      baseServerAt: Number(room.resumingUntil),
+    };
+  }
+  return {
+    baseTick: 0,
+    baseServerAt: Number(room?.startAt) || Date.now(),
+  };
+}
+
+function roomApplyTick(room, applyAt) {
+  const { baseTick, baseServerAt } = roomClockEpoch(room);
+  const deltaSteps = Math.ceil(((Number(applyAt) - baseServerAt) / SIM_STEP_MS) - 1e-9);
+  return Math.max(baseTick + 1, baseTick + deltaSteps);
 }
 
 export default {
@@ -365,6 +393,8 @@ export class CXMatchHub extends DurableObject {
         startAt,
         nextServerSeq: 0,
         events: [],
+        clockBaseTick: 0,
+        clockBaseServerAt: startAt,
         suspended: false,
         pauseTick: null,
         graceDeadline: null,
@@ -475,6 +505,7 @@ export class CXMatchHub extends DurableObject {
     const clientSeq = data.clientSeq ?? null;
     const serverReceivedAt = Date.now();
     const applyAt = serverReceivedAt + RELAY_DELAY_MS;
+    const applyTick = roomApplyTick(room, applyAt);
     const serverSeq = (Number(room.nextServerSeq) || 0) + 1;
 
     const event = {
@@ -487,6 +518,7 @@ export class CXMatchHub extends DurableObject {
       clientSeq,
       serverReceivedAt,
       applyAt,
+      applyTick,
       action: data.action ?? null,
     };
 
@@ -512,6 +544,7 @@ export class CXMatchHub extends DurableObject {
       serverSeq,
       serverReceivedAt,
       applyAt,
+      applyTick,
       serverNow: Date.now(),
     }, "deploy_ack");
 
@@ -524,6 +557,7 @@ export class CXMatchHub extends DurableObject {
       serverSeq,
       serverReceivedAt,
       applyAt,
+      applyTick,
       delivered,
       action: data.action ?? null,
     });
@@ -649,6 +683,8 @@ export class CXMatchHub extends DurableObject {
     room.graceDeadline = null;
     room.resumingUntil = resumeAt;
     room.pauseTick = resumeTick;
+    room.clockBaseTick = resumeTick;
+    room.clockBaseServerAt = resumeAt;
     for (const team of ["blue", "red"]) {
       if (room.seats?.[team]) {
         room.seats[team].connected = true;
@@ -667,6 +703,8 @@ export class CXMatchHub extends DurableObject {
       roomId,
       resumeTick,
       resumeAt,
+      clockBaseTick: room.clockBaseTick,
+      clockBaseServerAt: room.clockBaseServerAt,
       originalStartAt: room.startAt,
       lastServerSeq: Number(room.nextServerSeq) || 0,
       events: Array.isArray(room.events) ? room.events : [],
