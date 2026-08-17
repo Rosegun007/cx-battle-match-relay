@@ -1,9 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 
 const PROTOCOL_VERSION = 1;
-const SERVICE_VERSION = "S0004";
+const SERVICE_VERSION = "S0005";
 const MATCH_START_DELAY_MS = 5000;
-const RELAY_DELAY_MS = 150;
+const MIN_RELAY_LEAD_MS = 350;
+const MAX_RELAY_LEAD_MS = 1200;
+const RELAY_JITTER_GUARD_MS = 120;
 const SIM_STEP_MS = 1000 / 60;
 const RECONNECT_GRACE_MS = 30000;
 const RESUME_START_DELAY_MS = 2500;
@@ -56,6 +58,23 @@ function roomClockEpoch(room) {
     baseTick: 0,
     baseServerAt: Number(room?.startAt) || Date.now(),
   };
+}
+
+
+function normalizedRttMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.max(0, Math.min(2000, n));
+}
+
+function roomRelayLeadMs(room) {
+  const rtts = [room?.seats?.blue?.rttMs, room?.seats?.red?.rttMs]
+    .map(normalizedRttMs)
+    .filter((v) => v != null);
+  const worstRtt = rtts.length ? Math.max(...rtts) : 0;
+  // A0284/S0005：部署事件必须给两端留出真正的网络传播余量。
+  // 使用“最差一端完整RTT + 抖动余量”，比仅估算单程更保守，尤其适合VPN/移动网络刚重连后的瞬时抖动。
+  return Math.max(MIN_RELAY_LEAD_MS, Math.min(MAX_RELAY_LEAD_MS, Math.ceil(worstRtt + RELAY_JITTER_GUARD_MS)));
 }
 
 function roomApplyTick(room, applyAt) {
@@ -332,6 +351,7 @@ export class CXMatchHub extends DurableObject {
       ...session,
       clientId: String(data.clientId || session.sessionId),
       ruleVersion: data.ruleVersion == null ? null : String(data.ruleVersion),
+      rttMs: normalizedRttMs(data.rttMs),
       status: "waiting",
       queueOrder,
       queuedAt: Date.now(),
@@ -406,6 +426,7 @@ export class CXMatchHub extends DurableObject {
             connected: true,
             ruleVersion: blueSession.ruleVersion ?? null,
             clientId: blueSession.clientId ?? null,
+            rttMs: normalizedRttMs(blueSession.rttMs),
             lastTick: 0,
             lastCheckpointTick: 0,
             lastServerSeq: 0,
@@ -417,6 +438,7 @@ export class CXMatchHub extends DurableObject {
             connected: true,
             ruleVersion: redSession.ruleVersion ?? null,
             clientId: redSession.clientId ?? null,
+            rttMs: normalizedRttMs(redSession.rttMs),
             lastTick: 0,
             lastCheckpointTick: 0,
             lastServerSeq: 0,
@@ -504,7 +526,8 @@ export class CXMatchHub extends DurableObject {
 
     const clientSeq = data.clientSeq ?? null;
     const serverReceivedAt = Date.now();
-    const applyAt = serverReceivedAt + RELAY_DELAY_MS;
+    const relayLeadMs = roomRelayLeadMs(room);
+    const applyAt = serverReceivedAt + relayLeadMs;
     const applyTick = roomApplyTick(room, applyAt);
     const serverSeq = (Number(room.nextServerSeq) || 0) + 1;
 
@@ -519,6 +542,7 @@ export class CXMatchHub extends DurableObject {
       serverReceivedAt,
       applyAt,
       applyTick,
+      relayLeadMs,
       action: data.action ?? null,
     };
 
@@ -545,6 +569,7 @@ export class CXMatchHub extends DurableObject {
       serverReceivedAt,
       applyAt,
       applyTick,
+      relayLeadMs,
       serverNow: Date.now(),
     }, "deploy_ack");
 
@@ -558,6 +583,7 @@ export class CXMatchHub extends DurableObject {
       serverReceivedAt,
       applyAt,
       applyTick,
+      relayLeadMs,
       delivered,
       action: data.action ?? null,
     });
@@ -574,6 +600,8 @@ export class CXMatchHub extends DurableObject {
     seat.lastTick = Math.max(0, Math.floor(Number(data.tick) || 0));
     seat.lastCheckpointTick = Math.max(0, Math.floor(Number(data.checkpointTick) || 0));
     seat.lastServerSeq = Math.max(0, Math.floor(Number(data.lastServerSeq) || 0));
+    const heartbeatRtt = normalizedRttMs(data.rttMs);
+    if (heartbeatRtt != null) seat.rttMs = heartbeatRtt;
     seat.lastSeenAt = Date.now();
     await this.ctx.storage.put(key, room);
   }
@@ -620,6 +648,8 @@ export class CXMatchHub extends DurableObject {
     seat.lastTick = Math.max(Number(seat.lastTick) || 0, Math.floor(Number(data.localTick) || 0));
     seat.lastCheckpointTick = Math.max(Number(seat.lastCheckpointTick) || 0, Math.floor(Number(data.checkpointTick) || 0));
     seat.lastServerSeq = Math.max(Number(seat.lastServerSeq) || 0, Math.floor(Number(data.lastServerSeq) || 0));
+    const resumedRtt = normalizedRttMs(data.rttMs);
+    if (resumedRtt != null) seat.rttMs = resumedRtt;
 
     const opponentTeam = team === "blue" ? "red" : "blue";
     const opponentSeat = room.seats[opponentTeam];
