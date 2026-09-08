@@ -94,7 +94,6 @@ export default {
         serviceVersion: SERVICE_VERSION,
         protocol: PROTOCOL_VERSION,
         reconnectGraceMs: RECONNECT_GRACE_MS,
-        mode: "MIN_WS_TEST3_OFFICIAL_BARE_101",
         serverNow: Date.now(),
       });
     }
@@ -108,11 +107,21 @@ export default {
         return new Response("Expected GET", { status: 405 });
       }
 
-      // MIN_WS_TEST3：严格按 Cloudflare 官方最小示例，只测试 101 Upgrade。
-      const pair = new WebSocketPair();
-      const [client, server] = Object.values(pair);
-      server.accept();
-      return new Response(null, { status: 101, webSocket: client });
+      try {
+        const stub = env.CX_MATCH_HUB.getByName(HUB_NAME);
+        return await stub.fetch(request);
+      } catch (error) {
+        const errorId = crypto.randomUUID();
+        console.error(`[CX:${SERVICE_VERSION}][worker->durable]`, errorId, errorText(error));
+        return json({
+          ok: false,
+          service: "cx-battle-match-relay",
+          serviceVersion: SERVICE_VERSION,
+          error: "durable_object_unavailable",
+          errorId,
+          serverNow: Date.now(),
+        }, 503);
+      }
     }
 
     return json({
@@ -120,7 +129,6 @@ export default {
       serviceVersion: SERVICE_VERSION,
       protocol: PROTOCOL_VERSION,
       reconnectGraceMs: RECONNECT_GRACE_MS,
-      mode: "MIN_WS_TEST3_OFFICIAL_BARE_101",
       endpoints: { health: "/health", websocket: "/ws" },
     });
   },
