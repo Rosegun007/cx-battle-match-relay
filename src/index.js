@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 
 const PROTOCOL_VERSION = 1;
 const SERVICE_VERSION = "S0005";
+const DIAG_BUILD = "S0005-DIAG1";
 const MATCH_START_DELAY_MS = 5000;
 const MIN_RELAY_LEAD_MS = 350;
 const MAX_RELAY_LEAD_MS = 1200;
@@ -98,6 +99,88 @@ export default {
       });
     }
 
+    if (url.pathname === "/diag") {
+      return json({
+        ok: true,
+        service: "cx-battle-match-relay",
+        serviceVersion: SERVICE_VERSION,
+        diagBuild: DIAG_BUILD,
+        tests: {
+          directWebSocket: "/diag/ws-direct",
+          durableObjectHttp: "/diag/do-http",
+          productionWebSocket: "/ws",
+        },
+        serverNow: Date.now(),
+      });
+    }
+
+    // 诊断1：完全绕开 Durable Object，在普通 Worker 内直接完成 WebSocket Upgrade。
+    // 若这个也失败，问题不在 CX_MATCH_HUB，而在该 hostname/Worker 的 WebSocket Upgrade 路径。
+    if (url.pathname === "/diag/ws-direct") {
+      const upgrade = request.headers.get("Upgrade");
+      if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+        return new Response("Expected WebSocket upgrade", { status: 426 });
+      }
+      if (request.method !== "GET") {
+        return new Response("Expected GET", { status: 405 });
+      }
+
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept();
+      server.send(JSON.stringify({
+        op: "diag_direct_connected",
+        ok: true,
+        serviceVersion: SERVICE_VERSION,
+        diagBuild: DIAG_BUILD,
+        serverNow: Date.now(),
+      }));
+      server.addEventListener("message", (event) => {
+        try {
+          server.send(JSON.stringify({
+            op: "diag_echo",
+            data: typeof event.data === "string" ? event.data : "[binary]",
+            serverNow: Date.now(),
+          }));
+        } catch {}
+      });
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // 诊断2：使用普通 HTTP 从 Worker 调用 CX_MATCH_HUB Durable Object。
+    // 这条链路不使用 WebSocket，用来单独验证绑定/实例调用是否正常。
+    if (url.pathname === "/diag/do-http") {
+      try {
+        const stub = env.CX_MATCH_HUB.getByName(HUB_NAME);
+        const probe = new Request("https://cx-internal/__cx_diag_http", {
+          method: "GET",
+          headers: { "x-cx-diag": DIAG_BUILD },
+        });
+        const response = await stub.fetch(probe);
+        const text = await response.text();
+        return new Response(text, {
+          status: response.status,
+          headers: {
+            "content-type": response.headers.get("content-type") || "application/json; charset=utf-8",
+            "cache-control": "no-store",
+            "access-control-allow-origin": "*",
+          },
+        });
+      } catch (error) {
+        const errorId = crypto.randomUUID();
+        console.error(`[CX:${SERVICE_VERSION}][diag-worker->durable]`, errorId, errorText(error));
+        return json({
+          ok: false,
+          serviceVersion: SERVICE_VERSION,
+          diagBuild: DIAG_BUILD,
+          error: "diag_durable_object_unavailable",
+          errorId,
+          detail: errorText(error),
+          serverNow: Date.now(),
+        }, 503);
+      }
+    }
+
     if (url.pathname === "/ws") {
       const upgrade = request.headers.get("Upgrade");
       if (!upgrade || upgrade.toLowerCase() !== "websocket") {
@@ -154,7 +237,19 @@ export class CXMatchHub extends DurableObject {
     });
   }
 
-  async fetch() {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/__cx_diag_http" || request.headers.get("x-cx-diag")) {
+      return json({
+        ok: true,
+        component: "CXMatchHub",
+        serviceVersion: SERVICE_VERSION,
+        diagBuild: DIAG_BUILD,
+        restoredConnections: this.sessions.size,
+        serverNow: Date.now(),
+      });
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
