@@ -94,7 +94,7 @@ export default {
         serviceVersion: SERVICE_VERSION,
         protocol: PROTOCOL_VERSION,
         reconnectGraceMs: RECONNECT_GRACE_MS,
-        mode: "MIN_WS_TEST2_KEEP_DO_BINDING",
+        mode: "MIN_WS_TEST3_OFFICIAL_BARE_101",
         serverNow: Date.now(),
       });
     }
@@ -108,27 +108,10 @@ export default {
         return new Response("Expected GET", { status: 405 });
       }
 
-      // MIN_WS_TEST2：仅为诊断 WebSocket Upgrade。
-      // 保留原 Durable Object 绑定/迁移/类定义以确保 Cloudflare 可以正常部署，
-      // 但此 /ws 路由故意完全绕过 CX_MATCH_HUB。
+      // MIN_WS_TEST3：严格按 Cloudflare 官方最小示例，只测试 101 Upgrade。
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.accept();
-
-      server.send(JSON.stringify({
-        op: "connected",
-        protocol: PROTOCOL_VERSION,
-        serviceVersion: SERVICE_VERSION,
-        mode: "MIN_WS_TEST2_KEEP_DO_BINDING",
-        serverNow: Date.now(),
-      }));
-
-      server.addEventListener("message", (event) => {
-        try {
-          server.send(typeof event.data === "string" ? event.data : "binary");
-        } catch (_) {}
-      });
-
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -137,7 +120,7 @@ export default {
       serviceVersion: SERVICE_VERSION,
       protocol: PROTOCOL_VERSION,
       reconnectGraceMs: RECONNECT_GRACE_MS,
-      mode: "MIN_WS_TEST2_KEEP_DO_BINDING",
+      mode: "MIN_WS_TEST3_OFFICIAL_BARE_101",
       endpoints: { health: "/health", websocket: "/ws" },
     });
   },

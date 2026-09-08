@@ -1,6 +1,6 @@
 {
   "name": "cx-battle-match-relay",
-  "version": "0.0.5-min-ws-test2",
+  "version": "0.0.5-min-ws-test3",
   "private": true,
   "type": "module",
   "scripts": {
