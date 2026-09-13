@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 const PROTOCOL_VERSION = 1;
-const SERVICE_VERSION = "S0005";
+const SERVICE_VERSION = "S0006";
 const MATCH_START_DELAY_MS = 5000;
 const MIN_RELAY_LEAD_MS = 350;
 const MAX_RELAY_LEAD_MS = 1200;
@@ -37,6 +37,18 @@ function roomKey(roomId) {
 
 function newResumeToken() {
   return `${crypto.randomUUID()}-${crypto.randomUUID()}`;
+}
+
+function newMatchSeed() {
+  // S0006：每局仅由服务器权威生成一个非零32位起始随机种子。
+  // 后续随机数流不在服务器逐项生成/转发，而由双方客户端使用同一确定性PRNG本地展开。
+  const words = new Uint32Array(1);
+  let seed = 0;
+  while (seed === 0) {
+    crypto.getRandomValues(words);
+    seed = words[0] >>> 0;
+  }
+  return seed;
 }
 
 function roomClockEpoch(room) {
@@ -94,6 +106,7 @@ export default {
         serviceVersion: SERVICE_VERSION,
         protocol: PROTOCOL_VERSION,
         reconnectGraceMs: RECONNECT_GRACE_MS,
+        rngAuthority: "server-match-seed/client-deterministic-expansion",
         serverNow: Date.now(),
       });
     }
@@ -404,6 +417,7 @@ export class CXMatchHub extends DurableObject {
       const roomId = `CX_${String(roomNo).padStart(6, "0")}_${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
       const serverNow = Date.now();
       const startAt = serverNow + MATCH_START_DELAY_MS;
+      const matchSeed = newMatchSeed();
       const blueResumeToken = newResumeToken();
       const redResumeToken = newResumeToken();
 
@@ -411,6 +425,7 @@ export class CXMatchHub extends DurableObject {
         roomId,
         createdAt: serverNow,
         startAt,
+        matchSeed,
         nextServerSeq: 0,
         events: [],
         clockBaseTick: 0,
@@ -475,6 +490,8 @@ export class CXMatchHub extends DurableObject {
         roomId,
         serverNow,
         startAt,
+        matchSeed,
+        rngAuthority: "server-match-seed/client-deterministic-expansion",
         reconnectGraceMs: RECONNECT_GRACE_MS,
       };
 
@@ -499,6 +516,7 @@ export class CXMatchHub extends DurableObject {
         blueSessionId: blueSession.sessionId,
         redSessionId: redSession.sessionId,
         startAt,
+        matchSeed,
       });
     }
   }
@@ -736,6 +754,8 @@ export class CXMatchHub extends DurableObject {
       clockBaseTick: room.clockBaseTick,
       clockBaseServerAt: room.clockBaseServerAt,
       originalStartAt: room.startAt,
+      matchSeed: (Number(room.matchSeed) >>> 0) || 0x6d2b79f5,
+      rngAuthority: "server-match-seed/client-deterministic-expansion",
       lastServerSeq: Number(room.nextServerSeq) || 0,
       events: Array.isArray(room.events) ? room.events : [],
       serverNow: Date.now(),
@@ -749,6 +769,7 @@ export class CXMatchHub extends DurableObject {
       resumeAt,
       eventCount: payload.events.length,
       lastServerSeq: payload.lastServerSeq,
+      matchSeed: payload.matchSeed,
     });
   }
 
