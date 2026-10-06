@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-const SERVICE_VERSION='S0009', WIRE='CX_ORDERED_RELAY_S0009_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
-const HUB_NAME='cx-global-match-hub-s0009', ROOM_PREFIX='room:', MAX_PENDING=32;
-const PARAMS=Object.freeze({heartbeatMs:1000,connectionTimeoutMs:3000,waitingHeartbeatMs:10000,waitingTimeoutMs:30000,forwardReserveTicks:6,receiveMarginTicks:2,ackGraceTicks:30,maxClockLagTicks:60,proofTimeoutMs:15000});
+const SERVICE_VERSION='S0010', WIRE='CX_ORDERED_RELAY_S0010_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
+const HUB_NAME='cx-global-match-hub-s0010', ROOM_PREFIX='room:', MAX_PENDING=32;
+const PARAMS=Object.freeze({heartbeatMs:1000,connectionTimeoutMs:3000,waitingHeartbeatMs:10000,waitingTimeoutMs:30000,forwardReserveTicks:6,receiveMarginTicks:2,ackGraceTicks:30,maxClockLagTicks:60,proofTimeoutMs:15000,prepTicks:900,lockTicks:90});
 const isHash=h=>typeof h==='string'&&/^[0-9a-f]{16}$/.test(h);
 const json=d=>new Response(JSON.stringify(d),{headers:{'content-type':'application/json','cache-control':'no-store','access-control-allow-origin':'*'}});
 export default {async fetch(request,env){
@@ -76,6 +76,7 @@ export class CXMatchHub extends DurableObject {
  }
  confirmation(room){const v=room.verify;return {initConfirmed:v.initConfirmed,confirmedTick:v.confirmedTick,endTick:v.ends.blue!=null&&v.ends.blue===v.ends.red?v.ends.blue:null};}
  proofExpired(room){return !!room.startAt&&Date.now()>=room.startAt+PARAMS.proofTimeoutMs&&Date.now()-room.verify.lastAdvancedAt>=PARAMS.proofTimeoutMs;}
+ prepExpired(room){return !room.startAuthorized&&Date.now()>=(room.startAt??room.preStartAt+PARAMS.prepTicks/30*1000);}
  async message(ws,message){
   let s=this.sessions.get(ws);if(!s||s.status==='spent')return;
   if(typeof message!=='string'||message.length>65536)return this.error(ws,'invalid-envelope');let d;
@@ -92,22 +93,42 @@ export class CXMatchHub extends DurableObject {
   if(d?.op==='heartbeat'&&s.status!=='matched'){this.send(ws,{op:'heartbeat',id:d.id,status:s.status,serverNow:Date.now()});await this.arm();return;}
   if(s.status!=='matched'||!s.roomId)return this.error(ws,'wrong-room');
   const room=await this.ctx.storage.get(ROOM_PREFIX+s.roomId);if(!room)return this.error(ws,'room-missing');
+  if(d.op==='prebattle_abort'){await this.closeRoom(room,String(d.reason||'prebattle-aborted').slice(0,100),'reconnect');return;}
+  if(this.prepExpired(room)){await this.closeRoom(room,'prebattle-deadline','reconnect');return;}
   if(['abort','leave_room','takeover'].includes(d.op)){await this.closeRoom(room,String(d.reason||'peer-left').slice(0,100));return;}
   if(d.op==='setup'){
-   if(room.startAt||room.setup[s.team])return;
-   room.setup[s.team]=d.setup;await this.ctx.storage.put(ROOM_PREFIX+room.roomId,room);this.peer(room.roomId,s.team,{op:'peer_ready',team:s.team});
+   if(!Number.isInteger(d.prepTick)||d.prepTick<0||d.prepTick>PARAMS.prepTicks-PARAMS.lockTicks||d.prepTick>Math.max(0,Math.ceil((Date.now()-room.preStartAt)*30/1000))+PARAMS.maxClockLagTicks||!d.setup){await this.closeRoom(room,'invalid-setup-envelope','reconnect');return;}
+   if(room.setup[s.team]){
+    if(room.commitTicks[s.team]!==d.prepTick||JSON.stringify(room.setup[s.team])!==JSON.stringify(d.setup))await this.closeRoom(room,'setup-conflict','reconnect');
+    return;
+   }
+   room.setup[s.team]=d.setup;room.commitTicks[s.team]=d.prepTick;
    if(room.setup.blue&&room.setup.red){
-    room.startAt=Date.now()+4000;room.verify.lastAdvancedAt=room.startAt;
-    await this.ctx.storage.put(ROOM_PREFIX+room.roomId,room);
-    this.broadcast(room.roomId,{op:'start_plan',wireProtocol:WIRE,simulationProtocol:CORE,parameters:PARAMS,startAt:room.startAt,setup:room.setup});
-   }return;
+    room.startPreTick=Math.max(room.commitTicks.blue,room.commitTicks.red)+PARAMS.lockTicks;
+    room.startAt=room.preStartAt+room.startPreTick/30*1000;room.verify.lastAdvancedAt=room.startAt;
+    if(Date.now()>=room.startAt){await this.closeRoom(room,'setup-deadline','reconnect');return;}
+   }
+   await this.ctx.storage.put(ROOM_PREFIX+room.roomId,room);
+   this.peer(room.roomId,s.team,{op:'peer_setup',team:s.team,prepTick:d.prepTick,setup:d.setup});return;
+  }
+  if(d.op==='initial_state'){
+   if(room.startAuthorized&&room.verify.init[s.team]===d.initHash)return;
+   if(!room.startAt||Date.now()>=room.startAt||d.startPreTick!==room.startPreTick){await this.closeRoom(room,'initial-deadline-or-tick','reconnect');return;}
+   const problem=this.acceptProof(room,s.team,{initHash:d.initHash,progress:{tick:0,seq:0,ack_seq:0,ended:false},checkpoints:[{tick:0,hash:d.checkpointHash}]});
+   if(problem||!isHash(d.initHash)){await this.closeRoom(room,problem||'invalid-initial-hash','reconnect');return;}
+   const ready=room.verify.initConfirmed&&room.verify.confirmedTick===0;
+   if(ready)room.startAuthorized=true;
+   await this.ctx.storage.put(ROOM_PREFIX+room.roomId,room);
+   if(ready)this.broadcast(room.roomId,{op:'start_confirm',startPreTick:room.startPreTick,startAt:room.startAt,...this.confirmation(room)});
+   return;
   }
   const tick_server=room.startAt?Math.max(0,Math.floor((Date.now()-room.startAt)*30/1000)):0;
   if(d.op==='heartbeat'){
+   if(!room.startAuthorized&&(d.initHash!=null||d.progress!=null||d.checkpoints?.length)){await this.closeRoom(room,'unexpected-prebattle-proof','reconnect');return;}
    if(d.progress!=null){
     if(!this.validProgress(d.progress))return this.error(ws,'invalid-progress');
     if(s.progress&&(d.progress.tick<s.progress.tick||d.progress.seq<s.progress.seq||d.progress.ack_seq<s.progress.ack_seq))return this.error(ws,'regressed-progress');
-    s={...s,progress:d.progress};this.setSession(ws,s);
+    s={...s,progress:d.progress};this.setSession(ws,s);room.battleJoined[s.team]=true;
    }
    const peer=[...this.sessions.values()].find(v=>v.roomId===s.roomId&&v.team!==s.team);
    if(!peer||Date.now()-peer.lastSeen>=PARAMS.connectionTimeoutMs){await this.closeRoom(room,'peer-timeout');return;}
@@ -117,10 +138,10 @@ export class CXMatchHub extends DurableObject {
    if(confirmation.endTick!=null&&confirmation.confirmedTick===confirmation.endTick){await this.closeRoom(room,'verified-complete','finished',confirmation);return;}
    if(this.proofExpired(room)){await this.closeRoom(room,'checkpoint-timeout');return;}
    await this.ctx.storage.put(ROOM_PREFIX+room.roomId,room);
-   this.send(ws,{op:'heartbeat',id:d.id,status:'matched',serverNow:Date.now(),tick_server,peer:peer.progress,...confirmation});
+   this.send(ws,{op:'heartbeat',id:d.id,status:'matched',serverNow:Date.now(),tick_server,peer:peer.progress,battleActive:!!(room.battleJoined.blue&&room.battleJoined.red),...confirmation});
    await this.arm();return;
   }
-  if(d.op==='relay'&&room.startAt){
+  if(d.op==='relay'&&room.startAuthorized){
    const p=d.payload;if(!['input','ack'].includes(p?.kind))return this.error(ws,'unknown-relay-kind');
    if(p.kind==='input'){
     const c=p.command,w=p.windup_ticks;
@@ -137,15 +158,16 @@ export class CXMatchHub extends DurableObject {
   while(e.length>1){
    const a=e.shift(),i=e.findIndex(([,s])=>s.ruleVersion===a[1].ruleVersion&&s.tier===a[1].tier);if(i<0)continue;
    const b=e.splice(i,1)[0],roomId='CX_'+crypto.randomUUID(),words=new Uint32Array(1);do{crypto.getRandomValues(words);}while(!words[0]);
-   const now=Date.now(),room={roomId,matchSeed:words[0],createdAt:now,prepDeadline:now+27000,startAt:null,setup:{blue:null,red:null},verify:{init:{},initConfirmed:false,confirmedTick:-1,pending:{blue:{},red:{}},ends:{},lastAdvancedAt:now}};
+   const now=Date.now(),room={roomId,matchSeed:words[0],createdAt:now,preStartAt:now,startAt:null,startPreTick:null,startAuthorized:false,battleJoined:{blue:false,red:false},setup:{blue:null,red:null},commitTicks:{blue:null,red:null},verify:{init:{},initConfirmed:false,confirmedTick:-1,pending:{blue:{},red:{}},ends:{},lastAdvancedAt:now}};
    await this.ctx.storage.put(ROOM_PREFIX+roomId,room);
    for(const [[ws,s],team]of [[a,'blue'],[b,'red']])this.setSession(ws,{...s,status:'matched',played:true,roomId,team,lastSeen:now,progress:null});
-   for(const [[ws],team]of [[a,'blue'],[b,'red']])this.send(ws,{op:'match_found',roomId,team,matchSeed:room.matchSeed,serverNow:now,prepDeadline:room.prepDeadline,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:PARAMS});
+   for(const [[ws],team]of [[a,'blue'],[b,'red']])this.send(ws,{op:'match_found',roomId,team,matchSeed:room.matchSeed,serverNow:now,preStartAt:room.preStartAt,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:PARAMS});
   }
  }
  peer(roomId,team,p){let ok=false;for(const [ws,s]of this.sessions)if(s.status==='matched'&&s.roomId===roomId&&s.team!==team)ok=this.send(ws,p)||ok;return ok;}
  broadcast(roomId,p){for(const [ws,s]of this.sessions)if(s.status==='matched'&&s.roomId===roomId)this.send(ws,p);}
  async closeRoom(room,reason,transition='pve',extra={}){
+  if(transition==='pve'&&(!room.startAuthorized||Date.now()<room.startAt||!room.battleJoined.blue||!room.battleJoined.red))transition='reconnect';
   this.broadcast(room.roomId,{op:'room_closed',reason,transition,...extra});
   for(const [ws,s]of [...this.sessions])if(s.roomId===room.roomId)this.retire(ws);
   await this.ctx.storage.delete(ROOM_PREFIX+room.roomId);
@@ -163,7 +185,8 @@ export class CXMatchHub extends DurableObject {
   }
   const rows=await this.ctx.storage.list({prefix:ROOM_PREFIX});
   for(const r of rows.values()){
-   if(this.proofExpired(r))await this.closeRoom(r,'checkpoint-timeout');
+   if(this.prepExpired(r))await this.closeRoom(r,'prebattle-deadline','reconnect');
+   else if(this.proofExpired(r))await this.closeRoom(r,'checkpoint-timeout');
    else if(now-r.createdAt>=240000)await this.closeRoom(r,'room-expired');
   }
   await this.arm();
