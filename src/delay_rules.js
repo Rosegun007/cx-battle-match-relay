@@ -1,4 +1,4 @@
-// CX对战 S0011：仅包含无需运行战斗引擎的权威通信窗口与责任分摊。
+// CX对战 S0012：仅包含无需运行战斗引擎的权威通信窗口与责任分摊。
 // 必须与客户端 DEPLOY_MODE_RULES / BATTLE_FLAG_CONFIG 保持一致；升级战斗规则时同步审计。
 export const TICK_RATE = 30;
 export const DEPLOY_SECONDS = Object.freeze({
