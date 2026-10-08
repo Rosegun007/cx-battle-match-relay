@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
-const SERVICE_VERSION='S0010', WIRE='CX_ORDERED_RELAY_S0010_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
+import {authoritativeWindupTicks,legalWindowTicks,serverTick,delayResponsibility,validInputEnvelope} from "./delay_rules.js";
+const SERVICE_VERSION='S0011', WIRE='CX_ORDERED_RELAY_S0011_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
 const HUB_NAME='cx-global-match-hub-s0010', ROOM_PREFIX='room:', MAX_PENDING=32;
-const PARAMS=Object.freeze({heartbeatMs:1000,connectionTimeoutMs:3000,waitingHeartbeatMs:10000,waitingTimeoutMs:30000,forwardReserveTicks:6,receiveMarginTicks:2,ackGraceTicks:30,maxClockLagTicks:60,proofTimeoutMs:15000,prepTicks:900,lockTicks:90});
+const PARAMS=Object.freeze({heartbeatMs:1000,connectionTimeoutMs:3000,waitingHeartbeatMs:10000,waitingTimeoutMs:30000,forwardReserveTicks:0,receiveMarginTicks:0,legalWindowPercent:80,ackGraceTicks:30,maxClockLagTicks:60,maxInputFutureTicks:12,proofTimeoutMs:15000,prepTicks:900,lockTicks:90});
 const isHash=h=>typeof h==='string'&&/^[0-9a-f]{16}$/.test(h);
 const json=d=>new Response(JSON.stringify(d),{headers:{'content-type':'application/json','cache-control':'no-store','access-control-allow-origin':'*'}});
 export default {async fetch(request,env){
@@ -40,7 +41,7 @@ export class CXMatchHub extends DurableObject {
   this.send(server,{op:'connected',serviceVersion:SERVICE_VERSION,wireProtocol:WIRE,simulationProtocol:CORE,parameters:PARAMS,serverNow:Date.now()});
   return new Response(null,{status:101,webSocket:client});
  }
- webSocketMessage(ws,message){const t=this.serial.then(()=>this.message(ws,message));this.serial=t.catch(()=>{});return t;}
+ webSocketMessage(ws,message){const receivedAt=Date.now();const t=this.serial.then(()=>this.message(ws,message,receivedAt));this.serial=t.catch(()=>{});return t;}
  validProgress(p){return p&&Number.isInteger(p.tick)&&p.tick>=0&&p.tick<=5400&&Number.isSafeInteger(p.seq)&&p.seq>=0&&p.seq<=1000000&&Number.isSafeInteger(p.ack_seq)&&p.ack_seq>=0&&p.ack_seq<=1000000&&typeof p.ended==='boolean';}
  // Only compare client-supplied digests. No simulation or gameplay validation runs here.
  acceptProof(room,team,d){
@@ -77,7 +78,7 @@ export class CXMatchHub extends DurableObject {
  confirmation(room){const v=room.verify;return {initConfirmed:v.initConfirmed,confirmedTick:v.confirmedTick,endTick:v.ends.blue!=null&&v.ends.blue===v.ends.red?v.ends.blue:null};}
  proofExpired(room){return !!room.startAt&&Date.now()>=room.startAt+PARAMS.proofTimeoutMs&&Date.now()-room.verify.lastAdvancedAt>=PARAMS.proofTimeoutMs;}
  prepExpired(room){return !room.startAuthorized&&Date.now()>=(room.startAt??room.preStartAt+PARAMS.prepTicks/30*1000);}
- async message(ws,message){
+ async message(ws,message,receivedAt=Date.now()){
   let s=this.sessions.get(ws);if(!s||s.status==='spent')return;
   if(typeof message!=='string'||message.length>65536)return this.error(ws,'invalid-envelope');let d;
   try{d=JSON.parse(message);}catch{return this.error(ws,'bad-json');}
@@ -122,7 +123,7 @@ export class CXMatchHub extends DurableObject {
    if(ready)this.broadcast(room.roomId,{op:'start_confirm',startPreTick:room.startPreTick,startAt:room.startAt,...this.confirmation(room)});
    return;
   }
-  const tick_server=room.startAt?Math.max(0,Math.floor((Date.now()-room.startAt)*30/1000)):0;
+  const tick_server=room.startAt?serverTick(Date.now(),room.startAt):0;
   if(d.op==='heartbeat'){
    if(!room.startAuthorized&&(d.initHash!=null||d.progress!=null||d.checkpoints?.length)){await this.closeRoom(room,'unexpected-prebattle-proof','reconnect');return;}
    if(d.progress!=null){
@@ -141,14 +142,41 @@ export class CXMatchHub extends DurableObject {
    this.send(ws,{op:'heartbeat',id:d.id,status:'matched',serverNow:Date.now(),tick_server,peer:peer.progress,battleActive:!!(room.battleJoined.blue&&room.battleJoined.red),...confirmation});
    await this.arm();return;
   }
+  // S0011: 接收超期由接收方报告；房间关闭前必须由服务器核验对应已转发操作。
+  if(d.op==='timeout_report'&&room.startAuthorized){
+   const op=room.relayEvidence?.[d.inputId];
+   if(!op||op.senderTeam===s.team||op.forwardTick==null){this.error(ws,'invalid-timeout-report');return;}
+   // 未超过权威窗口时禁止凭空提前中止对局。钟差造成的过早报告可在截止Tick后重试。
+   if(serverTick(Date.now(),room.startAt)<=op.tick+op.windowTicks){this.send(ws,{op:'timeout_report_wait',inputId:d.inputId,notBeforeTick:op.tick+op.windowTicks+1});return;}
+   const share=delayResponsibility({team:op.senderTeam,tick:op.tick,w:op.windowTicks,receiveTick:op.receiveTick,forwardTick:op.forwardTick});
+   await this.closeRoom(room,'receive-deadline','delay',{responsibleTeam:share.responsibleTeam,inputId:d.inputId});return;
+  }
   if(d.op==='relay'&&room.startAuthorized){
    const p=d.payload;if(!['input','ack'].includes(p?.kind))return this.error(ws,'unknown-relay-kind');
    if(p.kind==='input'){
-    const c=p.command,w=p.windup_ticks;
-    if(!c||c.team!==s.team||!Number.isInteger(c.tick)||c.tick<1||!Number.isInteger(w)||w<1||w>900)return this.error(ws,'invalid-input-envelope');
-    if(tick_server+PARAMS.forwardReserveTicks>c.tick+w-PARAMS.receiveMarginTicks){await this.closeRoom(room,'forward-deadline');return;}
+    const c=p.command;
+    // 不信任客户端 windup_ticks；权威表控制完整时长及80%传输窗口。
+    if(!validInputEnvelope(c,s.team,room.tier)||!Number.isInteger(p.windup_ticks)||p.windup_ticks!==authoritativeWindupTicks(c,room.tier))return this.error(ws,'invalid-input-envelope');
+    if(Object.keys(room.relayEvidence||{}).length>=1024)return this.error(ws,'relay-evidence-limit');
+    const last=room.relaySeq?.[s.team]||{seq:0,tick:0};
+    if(c.seq!==last.seq+1||c.tick<last.tick||c.tick>serverTick(receivedAt,room.startAt)+PARAMS.maxInputFutureTicks)return this.error(ws,'invalid-input-sequence');
+    const fullTicks=authoritativeWindupTicks(c,room.tier),windowTicks=legalWindowTicks(fullTicks);
+    const receiveTick=serverTick(receivedAt,room.startAt),forwardTick=serverTick(Date.now(),room.startAt);
+    const evidence={senderTeam:s.team,tick:c.tick,seq:c.seq,fullTicks,windowTicks,receiveTick,forwardTick};
+    // 已过合法窗口：由服务器根据实际收到与转发时刻判定，不再用客户端传来的Windup延长窗口。
+    if(forwardTick>c.tick+windowTicks){
+     const share=delayResponsibility({team:s.team,tick:c.tick,w:windowTicks,receiveTick,forwardTick});
+     // 未被转发的指令不可能由接收方负责；只有来源段超半才认定发送方，否则未知。
+     if(share.responsibleTeam!==s.team)share.responsibleTeam=null;
+     await this.closeRoom(room,'forward-deadline','delay',{responsibleTeam:share.responsibleTeam,inputId:c.id});return;
+    }
+    // 记录已转发操作，允许稍后接收方根据该操作提交超期报告；不依赖客户端自报收包时刻。
+    if(!this.peer(room.roomId,s.team,{op:'relay',team:s.team,tick_server:forwardTick,payload:p})){await this.closeRoom(room,'peer-unavailable');return;}
+    room.relaySeq??={blue:{seq:0,tick:0},red:{seq:0,tick:0}};
+    room.relayEvidence??={};room.relaySeq[s.team]={seq:c.seq,tick:c.tick};room.relayEvidence[c.id]=evidence;
+    await this.ctx.storage.put(ROOM_PREFIX+room.roomId,room);return;
    }
-   if(p.kind==='ack'&&(!Number.isSafeInteger(p.ack_seq)||p.ack_seq<0))return this.error(ws,'invalid-ack');
+   if(!Number.isSafeInteger(p.ack_seq)||p.ack_seq<0||p.ack_seq>(room.relaySeq?.[s.team==='blue'?'red':'blue']?.seq||0))return this.error(ws,'invalid-ack');
    if(!this.peer(room.roomId,s.team,{op:'relay',team:s.team,tick_server,payload:p}))await this.closeRoom(room,'peer-unavailable');return;
   }
   this.error(ws,'unexpected-message');
@@ -158,7 +186,7 @@ export class CXMatchHub extends DurableObject {
   while(e.length>1){
    const a=e.shift(),i=e.findIndex(([,s])=>s.ruleVersion===a[1].ruleVersion&&s.tier===a[1].tier);if(i<0)continue;
    const b=e.splice(i,1)[0],roomId='CX_'+crypto.randomUUID(),words=new Uint32Array(1);do{crypto.getRandomValues(words);}while(!words[0]);
-   const now=Date.now(),room={roomId,matchSeed:words[0],createdAt:now,preStartAt:now,startAt:null,startPreTick:null,startAuthorized:false,battleJoined:{blue:false,red:false},setup:{blue:null,red:null},commitTicks:{blue:null,red:null},verify:{init:{},initConfirmed:false,confirmedTick:-1,pending:{blue:{},red:{}},ends:{},lastAdvancedAt:now}};
+   const now=Date.now(),room={roomId,matchSeed:words[0],createdAt:now,preStartAt:now,startAt:null,startPreTick:null,startAuthorized:false,tier:a[1].tier,relaySeq:{blue:{seq:0,tick:0},red:{seq:0,tick:0}},relayEvidence:{},battleJoined:{blue:false,red:false},setup:{blue:null,red:null},commitTicks:{blue:null,red:null},verify:{init:{},initConfirmed:false,confirmedTick:-1,pending:{blue:{},red:{}},ends:{},lastAdvancedAt:now}};
    await this.ctx.storage.put(ROOM_PREFIX+roomId,room);
    for(const [[ws,s],team]of [[a,'blue'],[b,'red']])this.setSession(ws,{...s,status:'matched',played:true,roomId,team,lastSeen:now,progress:null});
    for(const [[ws],team]of [[a,'blue'],[b,'red']])this.send(ws,{op:'match_found',roomId,team,matchSeed:room.matchSeed,serverNow:now,preStartAt:room.preStartAt,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:PARAMS});
