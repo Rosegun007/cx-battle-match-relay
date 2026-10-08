@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import {authoritativeWindupTicks,legalWindowTicks,serverTick,delayResponsibility,validInputEnvelope} from "./delay_rules.js";
-const SERVICE_VERSION='S0012', WIRE='CX_ORDERED_RELAY_S0012_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
+const SERVICE_VERSION='S0013', WIRE='CX_ORDERED_RELAY_S0013_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
 const HUB_NAME='cx-global-match-hub-s0010', ROOM_PREFIX='room:', CASE_PREFIX='disconnect-evidence:', MAX_PENDING=32;
 const PARAMS=Object.freeze({heartbeatMs:1000,connectionTimeoutMs:3000,waitingHeartbeatMs:10000,waitingTimeoutMs:30000,forwardReserveTicks:0,receiveMarginTicks:0,legalWindowPercent:80,ackGraceTicks:30,maxClockLagTicks:60,maxInputFutureTicks:12,proofTimeoutMs:15000,prepTicks:900,lockTicks:90,probeCount:3,disconnectObserveMs:1000,heartbeatAckTimeoutMs:3000,probeTimeoutMs:10000});
 const isHash=h=>typeof h==='string'&&/^[0-9a-f]{16}$/.test(h);
@@ -158,6 +158,9 @@ export class CXMatchHub extends DurableObject {
   try{d=JSON.parse(message);}catch{return this.error(ws,'bad-json');}
   s={...s,lastSeen:receivedAt};this.setSession(ws,s);
   if(d?.op==='clock_probe_reply'){this.acceptClockProbe(ws,s,d,receivedAt);return;}
+  // Initial heartbeat may race the three sequential server clock probes on slow mobiles.
+  // Keep the probe state intact; a keepalive is not an invalid handshake packet.
+  if(s.status==='probing'&&d?.op==='heartbeat'){this.send(ws,{op:'heartbeat',id:d.id,status:'probing',serverNow:Date.now()});return;}
   if(s.status==='probing')return this.error(ws,'clock-probe-required');
   if(d?.op==='ping')return this.error(ws,'server-clock-probe-only');
   if(d?.op==='join_queue'){
