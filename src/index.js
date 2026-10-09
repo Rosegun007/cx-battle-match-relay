@@ -1,84 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
-// CX对战 S0014：仅包含无需运行战斗引擎的权威通信窗口与责任分摊。
-// 必须与客户端 DEPLOY_MODE_RULES / BATTLE_FLAG_CONFIG 保持一致；升级战斗规则时同步审计。
-const TICK_RATE = 30;
-const DEPLOY_SECONDS = Object.freeze({
-  melee: Object.freeze({ slow:6, normal:4, fast:2, ultra:10 }),
-  ranged: Object.freeze({ slow:8, normal:5, fast:2, ultra:13 }),
-  tank: Object.freeze({ slow:9, normal:6, fast:3, ultra:20 }),
-  turret: Object.freeze({ slow:9, normal:6, fast:3, ultra:17 })
-});
-const FLAG_WINDUP_TICKS = Math.round(2.307692308 * TICK_RATE); // 69
-const FLAG_TYPES = Object.freeze(['arrowRain','fireballRain','healing']);
-function authoritativeWindupTicks(c,tier=3){
-  if(!c||typeof c!=='object')return null;
-  if(c.kind==='deploy'){
-    if(tier!==4&&c.mode==='ultra')return null;
-    const seconds=DEPLOY_SECONDS[c.unit]?.[c.mode];
-    return Number.isInteger(seconds)?seconds*TICK_RATE:null;
-  }
-  return c.kind==='flag'&&FLAG_TYPES.includes(c.type)?FLAG_WINDUP_TICKS:null;
-}
-function legalWindowTicks(windupTicks){
-  return Number.isSafeInteger(windupTicks)&&windupTicks>0?Math.floor(windupTicks*4/5):null;
-}
-// same server clock startAt, authoritative receive and forward timestamps in integer ticks
-function serverTick(atMs,startAt){return Math.max(0,Math.floor((atMs-startAt)*TICK_RATE/1000));}
-function delayResponsibility({team,tick,w,receiveTick,forwardTick}){
-  const a=Math.min(w,Math.max(0,receiveTick-tick));
-  const s=Math.min(w-a,Math.max(0,forwardTick-receiveTick));
-  const b=w-a-s;
-  const responsibleTeam=2*a>w?team:2*b>w?(team==='blue'?'red':'blue'):null;
-  return {a,s,b,w,responsibleTeam};
-}
-function validInputEnvelope(c,team,tier=3){
-  if(!c||c.team!==team||!Number.isSafeInteger(c.seq)||c.seq<1||c.seq>1000000||c.id!==`${team}:${c.seq}`||!Number.isInteger(c.tick)||c.tick<1||c.tick>5400||!Array.isArray(c.cell)||c.cell.length!==2||!c.cell.every(Number.isInteger))return false;
-  const [x,y]=c.cell;
-  if(x<0||x>=18||y<0||y>=32)return false;
-  if(c.kind==='flag'&&(y===15||y===16||!['corner','center'].includes(c.anchorKind)))return false;
-  return authoritativeWindupTicks(c,tier)!=null;
-}
-
-const SERVICE_VERSION='S0014', WIRE='CX_ORDERED_RELAY_S0014_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
+import {authoritativeWindupTicks,legalWindowTicks,serverTick,delayResponsibility,validInputEnvelope} from "./delay_rules.js";
+const SERVICE_VERSION='S0012', WIRE='CX_ORDERED_RELAY_S0012_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
 const HUB_NAME='cx-global-match-hub-s0010', ROOM_PREFIX='room:', CASE_PREFIX='disconnect-evidence:', MAX_PENDING=32;
 const PARAMS=Object.freeze({heartbeatMs:1000,connectionTimeoutMs:3000,waitingHeartbeatMs:10000,waitingTimeoutMs:30000,forwardReserveTicks:0,receiveMarginTicks:0,legalWindowPercent:80,ackGraceTicks:30,maxClockLagTicks:60,maxInputFutureTicks:12,proofTimeoutMs:15000,prepTicks:900,lockTicks:90,probeCount:3,disconnectObserveMs:1000,heartbeatAckTimeoutMs:3000,probeTimeoutMs:10000});
 const isHash=h=>typeof h==='string'&&/^[0-9a-f]{16}$/.test(h);
-// S0014: provisional four-account D1 login. A shared test password is NOT production authentication.
-const TEST_PASSWORD_SHA256 = '8901345041f528cf98d149bcd4134f634b4a4abd7a4f3c847703204eecbab7b0';
-const TEST_SESSION_MS = 12*60*60*1000;
-const TEST_ACCOUNT_RE = /^test00[1-4]$/;
-const authHeaders={'content-type':'application/json;charset=utf-8','cache-control':'no-store','access-control-allow-origin':'*','access-control-allow-methods':'POST,OPTIONS','access-control-allow-headers':'content-type','vary':'Origin'};
-const authJson=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:authHeaders});
-async function sha256Hex(text){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));return Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join('');}
-async function testAccountLogin(request,env){
- if(!env.CX_PLAYERS_DB)return authJson({ok:false,error:'d1-not-configured'},503);
- let d;try{if(Number(request.headers.get('content-length')||0)>4096)return authJson({ok:false,error:'invalid-request'},400);d=await request.json();}catch{return authJson({ok:false,error:'invalid-request'},400);}
- const user=String(d?.user||'');const pw=String(d?.pw||'');
- if(!TEST_ACCOUNT_RE.test(user)||pw.length>128||(await sha256Hex(pw))!==TEST_PASSWORD_SHA256)return authJson({ok:false,error:'invalid-credentials'},401);
- try{
-  const player=await env.CX_PLAYERS_DB.prepare('SELECT player_id,username,nickname,account_status FROM players WHERE username=?').bind(user).first();
-  if(!player||player.account_status!=='active')return authJson({ok:false,error:'account-unavailable'},403);
-  const secret=crypto.getRandomValues(new Uint8Array(32));const token=Array.from(secret,x=>x.toString(16).padStart(2,'0')).join('');
-  const hash=await sha256Hex(token);const now=Date.now(),expiresAt=now+TEST_SESSION_MS;
-  await env.CX_PLAYERS_DB.batch([
-   env.CX_PLAYERS_DB.prepare('INSERT INTO player_sessions(token_hash,player_id,created_at,expires_at) VALUES(?,?,?,?)').bind(hash,player.player_id,now,expiresAt),
-   env.CX_PLAYERS_DB.prepare('UPDATE players SET last_seen_at=? WHERE player_id=?').bind(now,player.player_id)
-  ]);
-  return authJson({ok:true,playerId:player.player_id,username:player.username,nickname:player.nickname,token,expiresAt,serviceVersion:SERVICE_VERSION});
- }catch(e){console.error('test-account-login-db',String(e));return authJson({ok:false,error:'database-error'},503);}
-}
-async function verifyTestSession(env,token){
- if(!env.CX_PLAYERS_DB||typeof token!=='string'||!/^[0-9a-f]{64}$/.test(token))return null;
- const tokenHash=await sha256Hex(token);
- const player=await env.CX_PLAYERS_DB.prepare(`SELECT p.player_id,p.username,p.nickname FROM player_sessions s JOIN players p ON p.player_id=s.player_id WHERE s.token_hash=? AND s.expires_at>? AND p.account_status='active'`).bind(tokenHash,Date.now()).first();
- return player||null;
-}
-
 const json=d=>new Response(JSON.stringify(d),{headers:{'content-type':'application/json','cache-control':'no-store','access-control-allow-origin':'*'}});
 export default {async fetch(request,env){
  const u=new URL(request.url);
- if(request.method==='OPTIONS'&&u.pathname==='/api/test-login')return new Response(null,{status:204,headers:authHeaders});
- if(u.pathname==='/api/test-login')return request.method==='POST'?testAccountLogin(request,env):authJson({ok:false,error:'method-not-allowed'},405);
  if(u.pathname==='/ws'){
   if(request.method!=='GET'||request.headers.get('Upgrade')?.toLowerCase()!=='websocket')return new Response('Expected WebSocket upgrade',{status:426});
   return env.CX_MATCH_HUB.getByName(HUB_NAME).fetch(request);
@@ -87,7 +15,7 @@ export default {async fetch(request,env){
 }};
 export class CXMatchHub extends DurableObject {
  constructor(ctx,env){
-  super(ctx,env);this.env=env;this.sessions=new Map();this.serial=Promise.resolve();
+  super(ctx,env);this.sessions=new Map();this.serial=Promise.resolve();
   for(const ws of ctx.getWebSockets()){
    const s=ws.deserializeAttachment();
    if(s&&s.status!=='spent')this.sessions.set(ws,s);
@@ -230,19 +158,11 @@ export class CXMatchHub extends DurableObject {
   try{d=JSON.parse(message);}catch{return this.error(ws,'bad-json');}
   s={...s,lastSeen:receivedAt};this.setSession(ws,s);
   if(d?.op==='clock_probe_reply'){this.acceptClockProbe(ws,s,d,receivedAt);return;}
-  // Initial heartbeat may race the three sequential server clock probes on slow mobiles.
-  // Keep the probe state intact; a keepalive is not an invalid handshake packet.
-  if(s.status==='probing'&&d?.op==='heartbeat'){this.send(ws,{op:'heartbeat',id:d.id,status:'probing',serverNow:Date.now()});return;}
   if(s.status==='probing')return this.error(ws,'clock-probe-required');
   if(d?.op==='ping')return this.error(ws,'server-clock-probe-only');
   if(d?.op==='join_queue'){
    if(d.wireProtocol!==WIRE||d.simulationProtocol!==CORE||d.tickRate!==30||s.probeRows?.length!==PARAMS.probeCount)return this.error(ws,'protocol-or-clock-probe-mismatch');
    if(s.played||s.status==='matched')return this.error(ws,'connection-already-used');
-   // Bind verified, unexpired player identity to this WS session, never trust an arbitrary client playerId.
-   let player;try{player=await verifyTestSession(this.env,d.authToken);}catch(e){console.error('queue-auth-db',String(e));return this.error(ws,'account-db-unavailable');}
-   if(!player)return this.error(ws,'login-required');
-   if([...this.sessions].some(([peer,other])=>peer!==ws&&other.playerId===player.player_id&&['waiting','matched'].includes(other.status)))return this.error(ws,'account-already-online');
-   s={...s,playerId:player.player_id};this.setSession(ws,s);
    if(s.status!=='waiting')this.setSession(ws,{...s,status:'waiting',roomId:null,team:null,progress:null,ruleVersion:String(d.ruleVersion||''),tier:d.deploySpeedTierCount===4?4:3,queuedAt:Date.now()});
    this.send(ws,{op:'queued'});await this.match();await this.arm();return;
   }
@@ -353,10 +273,9 @@ export class CXMatchHub extends DurableObject {
    const a=e.shift(),i=e.findIndex(([,s])=>s.ruleVersion===a[1].ruleVersion&&s.tier===a[1].tier);if(i<0)continue;
    const b=e.splice(i,1)[0],roomId='CX_'+crypto.randomUUID(),words=new Uint32Array(1);do{crypto.getRandomValues(words);}while(!words[0]);
    const now=Date.now(),room={roomId,matchSeed:words[0],createdAt:now,preStartAt:now,startAt:null,startPreTick:null,startAuthorized:false,tier:a[1].tier,probeEvidence:{blue:a[1].probeRows||[],red:b[1].probeRows||[]},relaySeq:{blue:{seq:0,tick:0},red:{seq:0,tick:0}},relayEvidence:{},battleJoined:{blue:false,red:false},setup:{blue:null,red:null},commitTicks:{blue:null,red:null},verify:{init:{},initConfirmed:false,confirmedTick:-1,pending:{blue:{},red:{}},ends:{},lastAdvancedAt:now}};
-   room.players={blue:a[1].playerId,red:b[1].playerId};
    await this.ctx.storage.put(ROOM_PREFIX+roomId,room);
    for(const [[ws,s],team]of [[a,'blue'],[b,'red']])this.setSession(ws,{...s,status:'matched',played:true,roomId,team,lastSeen:now,progress:null,lastHbAckAt:null,hbAckCount:0,hbChallenge:null});
-   for(const [[ws],team]of [[a,'blue'],[b,'red']])this.send(ws,{op:'match_found',roomId,team,matchSeed:room.matchSeed,playerId:team==='blue'?room.players.blue:room.players.red,serverNow:now,preStartAt:room.preStartAt,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:PARAMS});
+   for(const [[ws],team]of [[a,'blue'],[b,'red']])this.send(ws,{op:'match_found',roomId,team,matchSeed:room.matchSeed,serverNow:now,preStartAt:room.preStartAt,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:PARAMS});
   }
  }
  peer(roomId,team,p){let ok=false;for(const [ws,s]of this.sessions)if(s.status==='matched'&&s.roomId===roomId&&s.team!==team)ok=this.send(ws,p)||ok;return ok;}
