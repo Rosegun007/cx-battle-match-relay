@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-// CX对战 S0014：仅包含无需运行战斗引擎的权威通信窗口与责任分摊。
+// CX对战 S0015：仅包含无需运行战斗引擎的权威通信窗口与责任分摊。
 // 必须与客户端 DEPLOY_MODE_RULES / BATTLE_FLAG_CONFIG 保持一致；升级战斗规则时同步审计。
 const TICK_RATE = 30;
 const DEPLOY_SECONDS = Object.freeze({
@@ -39,9 +39,41 @@ function validInputEnvelope(c,team,tier=3){
   return authoritativeWindupTicks(c,tier)!=null;
 }
 
-const SERVICE_VERSION='S0014', WIRE='CX_ORDERED_RELAY_S0014_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
+const SERVICE_VERSION='S0015', WIRE='CX_ORDERED_RELAY_S0015_V1', CORE='CX_SIM_30HZ_ORDERED_INPUT_439_V1';
 const HUB_NAME='cx-global-match-hub-s0010', ROOM_PREFIX='room:', CASE_PREFIX='disconnect-evidence:', MAX_PENDING=32;
-const PARAMS=Object.freeze({heartbeatMs:1000,connectionTimeoutMs:3000,waitingHeartbeatMs:10000,waitingTimeoutMs:30000,forwardReserveTicks:0,receiveMarginTicks:0,legalWindowPercent:80,ackGraceTicks:30,maxClockLagTicks:60,maxInputFutureTicks:12,proofTimeoutMs:15000,prepTicks:900,lockTicks:90,probeCount:3,disconnectObserveMs:1000,heartbeatAckTimeoutMs:3000,probeTimeoutMs:10000});
+const PARAMS=Object.freeze({heartbeatMs:1000,connectionTimeoutMs:3000,waitingHeartbeatMs:10000,waitingTimeoutMs:30000,forwardReserveTicks:0,receiveMarginTicks:0,legalWindowPercent:80,ackGraceTicks:30,maxClockLagTicks:60,maxInputFutureTicks:12,proofTimeoutMs:15000,prepTicks:900,lockTicks:90,probeCount:3,disconnectObserveMs:1000,heartbeatAckTimeoutMs:3000,probeTimeoutMs:10000,disconnectForfeitAfterSeconds:60});
+// S0015: D1 stores one keyed JSON document. Only the explicitly mutable transport fields
+// can override code defaults; protocol/simulation/80%-windup invariants cannot change via D1.
+const MUTABLE_LIMITS=Object.freeze({
+ heartbeatMs:[500,3000],connectionTimeoutMs:[2000,20000],waitingHeartbeatMs:[1000,30000],
+ waitingTimeoutMs:[10000,120000],heartbeatAckTimeoutMs:[2000,20000],
+ disconnectObserveMs:[500,10000],proofTimeoutMs:[10000,60000],probeTimeoutMs:[5000,30000],
+ disconnectForfeitAfterSeconds:[1,180]
+});
+function validateDbSettings(raw){
+ if(!raw||typeof raw!=='object'||Array.isArray(raw))throw Error('settings-not-an-object');
+ const result={...PARAMS};
+ for(const [key,value] of Object.entries(raw)){
+  if(!Object.hasOwn(PARAMS,key))throw Error('unknown-setting:'+key);
+  if(!Number.isSafeInteger(value))throw Error('invalid-number:'+key);
+  const lim=MUTABLE_LIMITS[key];
+  if(lim){if(value<lim[0]||value>lim[1])throw Error('out-of-range:'+key);result[key]=value;}
+  else if(value!==PARAMS[key])throw Error('locked-setting:'+key);
+ }
+ if(result.connectionTimeoutMs<result.heartbeatMs*2||result.heartbeatAckTimeoutMs<result.heartbeatMs*2||result.waitingTimeoutMs<result.waitingHeartbeatMs*2)throw Error('inconsistent-heartbeat-timeouts');
+ return Object.freeze(result);
+}
+async function loadServerSettings(db){
+ if(!db)return {params:PARAMS,revision:0,source:'code-default',warning:'d1-not-configured'};
+ try{
+  const row=await db.prepare('SELECT settings_json,revision FROM server_settings WHERE config_key=?').bind('active').first();
+  if(!row)return {params:PARAMS,revision:0,source:'code-default',warning:'settings-row-not-found'};
+  const parsed=JSON.parse(row.settings_json);
+  const params=validateDbSettings(parsed);
+  return {params,revision:Number(row.revision)||0,source:'d1',warning:null};
+ }catch(err){console.error('settings-load',String(err));return {params:PARAMS,revision:0,source:'code-default',warning:String(err).slice(0,160)};}
+}
+
 const isHash=h=>typeof h==='string'&&/^[0-9a-f]{16}$/.test(h);
 // S0014: provisional four-account D1 login. A shared test password is NOT production authentication.
 const TEST_PASSWORD_SHA256 = '8901345041f528cf98d149bcd4134f634b4a4abd7a4f3c847703204eecbab7b0';
@@ -74,20 +106,45 @@ async function verifyTestSession(env,token){
  return player||null;
 }
 
+
+// S0015: authenticated one-match result lookup lets a disconnected client recover
+// the server verdict via HTTPS after its WebSocket can no longer receive it.
+async function lookupMyMatchResult(request,env){
+ if(!env.CX_PLAYERS_DB)return authJson({ok:false,error:'d1-not-configured'},503);
+ let d;try{if(Number(request.headers.get('content-length')||0)>4096)return authJson({ok:false,error:'invalid-request'},400);d=await request.json();}catch{return authJson({ok:false,error:'invalid-request'},400);}
+ const roomId=d?.roomId;
+ if(typeof roomId!=='string'||!/^CX_[a-fA-F0-9-]{30,50}$/.test(roomId))return authJson({ok:false,error:'invalid-room'},400);
+ try{
+  const player=await verifyTestSession(env,d.token);
+  if(!player)return authJson({ok:false,error:'login-required'},401);
+  const row=await env.CX_PLAYERS_DB.prepare(`SELECT match_id,blue_player_id,red_player_id,responsible_player_id,winner_player_id,win_stars,settlement_status FROM matches WHERE match_id=? AND (blue_player_id=? OR red_player_id=?)`).bind(roomId,player.player_id,player.player_id).first();
+  if(!row||row.settlement_status!=='settled')return authJson({ok:true,found:false});
+  const teams={blue:row.blue_player_id,red:row.red_player_id};
+  const responsibleTeam=row.responsible_player_id===teams.blue?'blue':row.responsible_player_id===teams.red?'red':null;
+  const winnerTeam=row.winner_player_id===teams.blue?'blue':row.winner_player_id===teams.red?'red':null;
+  return authJson({ok:true,found:true,result:{responsibleTeam,winnerTeam,forfeit:!!winnerTeam,stars:row.win_stars,settlementStatus:'settled'}});
+ }catch(err){console.error('lookup-match-result',String(err));return authJson({ok:false,error:'database-error'},503);}
+}
+
 const json=d=>new Response(JSON.stringify(d),{headers:{'content-type':'application/json','cache-control':'no-store','access-control-allow-origin':'*'}});
 export default {async fetch(request,env){
  const u=new URL(request.url);
- if(request.method==='OPTIONS'&&u.pathname==='/api/test-login')return new Response(null,{status:204,headers:authHeaders});
+ if(request.method==='OPTIONS'&&['/api/test-login','/api/match-result'].includes(u.pathname))return new Response(null,{status:204,headers:authHeaders});
  if(u.pathname==='/api/test-login')return request.method==='POST'?testAccountLogin(request,env):authJson({ok:false,error:'method-not-allowed'},405);
+ if(u.pathname==='/api/match-result')return request.method==='POST'?lookupMyMatchResult(request,env):authJson({ok:false,error:'method-not-allowed'},405);
  if(u.pathname==='/ws'){
   if(request.method!=='GET'||request.headers.get('Upgrade')?.toLowerCase()!=='websocket')return new Response('Expected WebSocket upgrade',{status:426});
   return env.CX_MATCH_HUB.getByName(HUB_NAME).fetch(request);
  }
- return json({ok:true,serviceVersion:SERVICE_VERSION,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:PARAMS,serverNow:Date.now()});
+ // The authoritative hub reports the values actually loaded into its memory (not just D1's newest row).
+ const hub=env.CX_MATCH_HUB.getByName(HUB_NAME);
+ return hub.fetch(new Request('https://cx-hub.internal/_internal/config-health'));
 }};
 export class CXMatchHub extends DurableObject {
  constructor(ctx,env){
   super(ctx,env);this.env=env;this.sessions=new Map();this.serial=Promise.resolve();
+  this.activeConfig={params:PARAMS,revision:0,source:'code-default',warning:'loading'};
+  ctx.blockConcurrencyWhile(async()=>{this.activeConfig=await loadServerSettings(env.CX_PLAYERS_DB);});
   for(const ws of ctx.getWebSockets()){
    const s=ws.deserializeAttachment();
    if(s&&s.status!=='spent')this.sessions.set(ws,s);
@@ -97,6 +154,7 @@ export class CXMatchHub extends DurableObject {
  }
  setSession(ws,s){this.sessions.set(ws,s);ws.serializeAttachment(s);}
  send(ws,p){try{ws.send(JSON.stringify(p));return true;}catch{return false;}}
+ params(room=null){return room?.params||this.activeConfig.params;}
  error(ws,code){this.send(ws,{op:'error',code,serviceVersion:SERVICE_VERSION});}
  retire(ws){
   const s=this.sessions.get(ws);if(s)this.setSession(ws,{...s,status:'spent',roomId:null,team:null,progress:null});
@@ -110,11 +168,15 @@ export class CXMatchHub extends DurableObject {
   const at=Date.now()+(orphanedCases?500:active.some(s=>s.status==='matched')?1000:10000),old=await this.ctx.storage.getAlarm();
   if(old===null||old>at)await this.ctx.storage.setAlarm(at);
  }
- async fetch(){
+ async fetch(request){
+  if(new URL(request.url).pathname==='/_internal/config-health'){
+   const c=this.activeConfig;
+   return json({ok:true,serviceVersion:SERVICE_VERSION,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:c.params,configRevision:c.revision,configSource:c.source,configWarning:c.warning,serverNow:Date.now()});
+  }
   const [client,server]=Object.values(new WebSocketPair());this.ctx.acceptWebSocket(server);
   const session={sessionId:crypto.randomUUID(),status:'probing',roomId:null,team:null,played:false,lastSeen:Date.now(),probeStartedAt:Date.now(),progress:null,probeRows:[],hbChallenge:null,hbSeq:0,lastHbAckAt:null};
   this.setSession(server,session);
-  this.send(server,{op:'connected',sessionId:session.sessionId,serviceVersion:SERVICE_VERSION,wireProtocol:WIRE,simulationProtocol:CORE,parameters:PARAMS,serverNow:Date.now()});
+  this.send(server,{op:'connected',sessionId:session.sessionId,serviceVersion:SERVICE_VERSION,wireProtocol:WIRE,simulationProtocol:CORE,parameters:this.activeConfig.params,configRevision:this.activeConfig.revision,serverNow:Date.now()});
   this.sendClockProbe(server,session);
   await this.arm();
   return new Response(null,{status:101,webSocket:client});
@@ -124,7 +186,7 @@ export class CXMatchHub extends DurableObject {
   sendClockProbe(ws,s){
     const seq=s.probeRows.length+1,nonce=crypto.randomUUID(),sentAt=Date.now();
     s={...s,probePending:{seq,nonce,sentAt}};this.setSession(ws,s);
-    this.send(ws,{op:'clock_probe',seq,nonce,serverSentAt:sentAt,probeCount:PARAMS.probeCount});
+    this.send(ws,{op:'clock_probe',seq,nonce,serverSentAt:sentAt,probeCount:this.params().probeCount});
   }
   acceptClockProbe(ws,s,d,receivedAt){
     const q=s.probePending;
@@ -132,11 +194,11 @@ export class CXMatchHub extends DurableObject {
     const row={seq:q.seq,serverSentAt:q.sentAt,serverReceivedAt:receivedAt,rttMs:Math.max(0,receivedAt-q.sentAt)};
     s={...s,probePending:null,probeRows:[...s.probeRows,row]};this.setSession(ws,s);
     this.send(ws,{op:'clock_probe_result',seq:q.seq,serverSentAt:q.sentAt,serverReceivedAt:receivedAt,clientReceivedAt:d.clientReceivedAt,clientSentAt:d.clientSentAt,rttMs:row.rttMs});
-    if(s.probeRows.length<PARAMS.probeCount)this.sendClockProbe(ws,s);
+    if(s.probeRows.length<this.params().probeCount)this.sendClockProbe(ws,s);
     else {
       const bestRttMs=Math.min(...s.probeRows.map(r=>r.rttMs));
       this.setSession(ws,{...s,status:'idle'});
-      this.send(ws,{op:'clock_probe_complete',samples:PARAMS.probeCount,bestRttMs});
+      this.send(ws,{op:'clock_probe_complete',samples:this.params().probeCount,bestRttMs});
     }
   }
   // Challenge is not guessable from a predictable heartbeat counter.
@@ -173,21 +235,54 @@ export class CXMatchHub extends DurableObject {
     await this.arm(true);
   }
   async finalizeDisconnect(room,at=Date.now()){
-    const c=room.disconnectCase;if(!c||at-c.since<PARAMS.disconnectObserveMs)return false;
+    if(room.finalVerdict)return this.completeDisconnectVerdict(room);
+  const c=room.disconnectCase;if(!c||at-c.since<this.params(room).disconnectObserveMs)return false;
     const observations={};
     for(const team of ['blue','red']){
       const s=[...this.sessions.values()].find(x=>x.status==='matched'&&x.roomId===room.roomId&&x.team===team);
       observations[team]={connected:!!s,seenAgoMs:s?Math.max(0,at-s.lastSeen):null,ackAgoMs:s?.lastHbAckAt!=null?Math.max(0,at-s.lastHbAckAt):null,acks:s?.hbAckCount||0,probeRttMs:room.probeEvidence?.[team]?.map(r=>r.rttMs)||[]};
-      if(s&&(at-s.lastSeen>=PARAMS.connectionTimeoutMs||(s.hbChallenge&&at-s.hbChallenge.sentAt>=PARAMS.heartbeatAckTimeoutMs)))c.causes[team]??='heartbeat-timeout';
+      if(s&&(at-s.lastSeen>=this.params(room).connectionTimeoutMs||(s.hbChallenge&&at-s.hbChallenge.sentAt>=this.params(room).heartbeatAckTimeoutMs)))c.causes[team]??='heartbeat-timeout';
     }
     const suspects=Object.keys(c.causes),culprit=suspects.length===1?suspects[0]:null;
-    const peer=culprit==='blue'?'red':'blue',healthy=culprit&&observations[peer]?.connected&&observations[peer].seenAgoMs<PARAMS.connectionTimeoutMs&&observations[peer].ackAgoMs<PARAMS.heartbeatAckTimeoutMs&&observations[peer].acks>0;
+    const peer=culprit==='blue'?'red':'blue',healthy=culprit&&observations[peer]?.connected&&observations[peer].seenAgoMs<this.params(room).connectionTimeoutMs&&observations[peer].ackAgoMs<this.params(room).heartbeatAckTimeoutMs&&observations[peer].acks>0;
     const responsibleTeam=healthy?culprit:null;
-    const verdict={reason:responsibleTeam?'single-side-disconnect':'unattributed-disconnect',responsibleTeam,observations};
-    await this.preserveDisconnectEvidence(room,verdict,at);
-    await this.closeRoom(room,verdict.reason,'disconnect',{responsibleTeam});
-    return true;
+  const verdict={reason:responsibleTeam?'single-side-disconnect':'unattributed-disconnect',responsibleTeam,observations};
+  // The threshold uses the FIRST observed outage, not the later attribution time.
+  const firstFailureAt=c.since;
+  const elapsedMs=room.startAt==null?0:Math.max(0,firstFailureAt-room.startAt);
+  const eligible=!!responsibleTeam&&room.startAuthorized===true&&room.battleJoined?.blue===true&&room.battleJoined?.red===true&&room.startAt!=null&&elapsedMs>=this.params(room).disconnectForfeitAfterSeconds*1000;
+  const winnerTeam=eligible?(responsibleTeam==='blue'?'red':'blue'):null;
+  room.finalVerdict={...verdict,firstFailureAt,elapsedMs,forfeit:eligible,winnerTeam,stars:eligible?2:0};
+  await this.ctx.storage.put(ROOM_PREFIX+room.roomId,room);
+  return this.completeDisconnectVerdict(room);
   }
+ async settleDisconnectMatch(room){
+  const d=room.finalVerdict;if(!d)return false;
+  const db=this.env.CX_PLAYERS_DB;if(!db)throw Error('d1-not-configured');
+  const loser=d.forfeit?room.players[d.responsibleTeam]:null;
+  const winner=d.forfeit?room.players[d.winnerTeam]:null;
+  // Batch is atomic on D1. The 'pending' guard prevents duplicated wins after retries.
+  await db.batch([
+   db.prepare(`INSERT OR IGNORE INTO matches(match_id,blue_player_id,red_player_id,started_at,ended_at,first_disconnect_at,end_tick,end_reason,responsible_player_id,winner_player_id,loser_player_id,win_stars,config_revision,settlement_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')`)
+    .bind(room.roomId,room.players.blue,room.players.red,room.startAt||null,Date.now(),d.firstFailureAt,room.startAt?serverTick(d.firstFailureAt,room.startAt):0,d.reason,d.responsibleTeam?room.players[d.responsibleTeam]:null,winner,loser,d.stars,room.configRevision||0),
+   db.prepare(`UPDATE players SET wins=wins+1 WHERE player_id=? AND EXISTS(SELECT 1 FROM matches WHERE match_id=? AND settlement_status='pending')`).bind(winner||'',room.roomId),
+   db.prepare(`UPDATE players SET losses=losses+1,disconnect_losses=disconnect_losses+1 WHERE player_id=? AND EXISTS(SELECT 1 FROM matches WHERE match_id=? AND settlement_status='pending')`).bind(loser||'',room.roomId),
+   db.prepare(`UPDATE matches SET settlement_status='settled' WHERE match_id=? AND settlement_status='pending'`).bind(room.roomId)
+  ]);
+  return true;
+ }
+ async completeDisconnectVerdict(room){
+  if(!room.finalVerdict)return false;
+  try{await this.settleDisconnectMatch(room);}
+  catch(err){
+   console.error('disconnect-settlement-pending',room.roomId,String(err));
+   await this.arm(true);return false; // Never claim a ranked result before it is persisted.
+  }
+  const v=room.finalVerdict;
+  await this.preserveDisconnectEvidence(room,v,Date.now());
+  await this.closeRoom(room,v.reason,'disconnect',{responsibleTeam:v.responsibleTeam,forfeit:v.forfeit,winnerTeam:v.winnerTeam,stars:v.stars,firstDisconnectAt:v.firstFailureAt,elapsedMs:v.elapsedMs,configRevision:room.configRevision||0,settlementStatus:'settled'});
+  return true;
+ }
  validProgress(p){return p&&Number.isInteger(p.tick)&&p.tick>=0&&p.tick<=5400&&Number.isSafeInteger(p.seq)&&p.seq>=0&&p.seq<=1000000&&Number.isSafeInteger(p.ack_seq)&&p.ack_seq>=0&&p.ack_seq<=1000000&&typeof p.ended==='boolean';}
  // Only compare client-supplied digests. No simulation or gameplay validation runs here.
  acceptProof(room,team,d){
@@ -222,8 +317,8 @@ export class CXMatchHub extends DurableObject {
   return null;
  }
  confirmation(room){const v=room.verify;return {initConfirmed:v.initConfirmed,confirmedTick:v.confirmedTick,endTick:v.ends.blue!=null&&v.ends.blue===v.ends.red?v.ends.blue:null};}
- proofExpired(room){return !!room.startAt&&Date.now()>=room.startAt+PARAMS.proofTimeoutMs&&Date.now()-room.verify.lastAdvancedAt>=PARAMS.proofTimeoutMs;}
- prepExpired(room){return !room.startAuthorized&&Date.now()>=(room.startAt??room.preStartAt+PARAMS.prepTicks/30*1000);}
+ proofExpired(room){return !!room.startAt&&Date.now()>=room.startAt+this.params(room).proofTimeoutMs&&Date.now()-room.verify.lastAdvancedAt>=this.params(room).proofTimeoutMs;}
+ prepExpired(room){return !room.startAuthorized&&Date.now()>=(room.startAt??room.preStartAt+this.params(room).prepTicks/30*1000);}
  async message(ws,message,receivedAt=Date.now()){
   let s=this.sessions.get(ws);if(!s||s.status==='spent')return;
   if(typeof message!=='string'||message.length>65536)return this.error(ws,'invalid-envelope');let d;
@@ -236,7 +331,7 @@ export class CXMatchHub extends DurableObject {
   if(s.status==='probing')return this.error(ws,'clock-probe-required');
   if(d?.op==='ping')return this.error(ws,'server-clock-probe-only');
   if(d?.op==='join_queue'){
-   if(d.wireProtocol!==WIRE||d.simulationProtocol!==CORE||d.tickRate!==30||s.probeRows?.length!==PARAMS.probeCount)return this.error(ws,'protocol-or-clock-probe-mismatch');
+   if(d.wireProtocol!==WIRE||d.simulationProtocol!==CORE||d.tickRate!==30||s.probeRows?.length!==this.params().probeCount)return this.error(ws,'protocol-or-clock-probe-mismatch');
    if(s.played||s.status==='matched')return this.error(ws,'connection-already-used');
    // Bind verified, unexpired player identity to this WS session, never trust an arbitrary client playerId.
    let player;try{player=await verifyTestSession(this.env,d.authToken);}catch(e){console.error('queue-auth-db',String(e));return this.error(ws,'account-db-unavailable');}
@@ -261,16 +356,16 @@ export class CXMatchHub extends DurableObject {
   }
   if(d.op==='prebattle_abort'){await this.closeRoom(room,String(d.reason||'prebattle-aborted').slice(0,100),'reconnect');return;}
   if(this.prepExpired(room)){await this.closeRoom(room,'prebattle-deadline','reconnect');return;}
-  if(['abort','leave_room','takeover'].includes(d.op)){await this.closeRoom(room,String(d.reason||'peer-left').slice(0,100));return;}
+  if(['abort','leave_room','takeover'].includes(d.op)){if(room.startAuthorized&&room.startAt!=null&&Date.now()>=room.startAt)await this.beginDisconnect(room,s.team,'client-'+d.op);else await this.closeRoom(room,String(d.reason||'peer-left').slice(0,100),'reconnect');return;}
   if(d.op==='setup'){
-   if(!Number.isInteger(d.prepTick)||d.prepTick<0||d.prepTick>PARAMS.prepTicks-PARAMS.lockTicks||d.prepTick>Math.max(0,Math.ceil((Date.now()-room.preStartAt)*30/1000))+PARAMS.maxClockLagTicks||!d.setup){await this.closeRoom(room,'invalid-setup-envelope','reconnect');return;}
+   if(!Number.isInteger(d.prepTick)||d.prepTick<0||d.prepTick>this.params(room).prepTicks-this.params(room).lockTicks||d.prepTick>Math.max(0,Math.ceil((Date.now()-room.preStartAt)*30/1000))+this.params(room).maxClockLagTicks||!d.setup){await this.closeRoom(room,'invalid-setup-envelope','reconnect');return;}
    if(room.setup[s.team]){
     if(room.commitTicks[s.team]!==d.prepTick||JSON.stringify(room.setup[s.team])!==JSON.stringify(d.setup))await this.closeRoom(room,'setup-conflict','reconnect');
     return;
    }
    room.setup[s.team]=d.setup;room.commitTicks[s.team]=d.prepTick;
    if(room.setup.blue&&room.setup.red){
-    room.startPreTick=Math.max(room.commitTicks.blue,room.commitTicks.red)+PARAMS.lockTicks;
+    room.startPreTick=Math.max(room.commitTicks.blue,room.commitTicks.red)+this.params(room).lockTicks;
     room.startAt=room.preStartAt+room.startPreTick/30*1000;room.verify.lastAdvancedAt=room.startAt;
     if(Date.now()>=room.startAt){await this.closeRoom(room,'setup-deadline','reconnect');return;}
    }
@@ -298,7 +393,7 @@ export class CXMatchHub extends DurableObject {
    }
    s=this.verifyHeartbeatAck(ws,s,d.serverHeartbeatAck,receivedAt);
    const peer=[...this.sessions.values()].find(v=>v.status==='matched'&&v.roomId===s.roomId&&v.team!==s.team);
-   if(!peer||Date.now()-peer.lastSeen>=PARAMS.connectionTimeoutMs){await this.beginDisconnect(room,s.team==='blue'?'red':'blue','peer-timeout',receivedAt);return;}
+   if(!peer||Date.now()-peer.lastSeen>=this.params(room).connectionTimeoutMs){await this.beginDisconnect(room,s.team==='blue'?'red':'blue','peer-timeout',receivedAt);return;}
    const problem=this.acceptProof(room,s.team,d);
    if(problem){await this.closeRoom(room,problem);return;}
    const confirmation=this.confirmation(room);
@@ -325,7 +420,7 @@ export class CXMatchHub extends DurableObject {
     if(!validInputEnvelope(c,s.team,room.tier)||!Number.isInteger(p.windup_ticks)||p.windup_ticks!==authoritativeWindupTicks(c,room.tier))return this.error(ws,'invalid-input-envelope');
     if(Object.keys(room.relayEvidence||{}).length>=1024)return this.error(ws,'relay-evidence-limit');
     const last=room.relaySeq?.[s.team]||{seq:0,tick:0};
-    if(c.seq!==last.seq+1||c.tick<last.tick||c.tick>serverTick(receivedAt,room.startAt)+PARAMS.maxInputFutureTicks)return this.error(ws,'invalid-input-sequence');
+    if(c.seq!==last.seq+1||c.tick<last.tick||c.tick>serverTick(receivedAt,room.startAt)+this.params(room).maxInputFutureTicks)return this.error(ws,'invalid-input-sequence');
     const fullTicks=authoritativeWindupTicks(c,room.tier),windowTicks=legalWindowTicks(fullTicks);
     const receiveTick=serverTick(receivedAt,room.startAt),forwardTick=serverTick(Date.now(),room.startAt);
     const evidence={senderTeam:s.team,tick:c.tick,seq:c.seq,fullTicks,windowTicks,receiveTick,forwardTick};
@@ -348,15 +443,15 @@ export class CXMatchHub extends DurableObject {
   this.error(ws,'unexpected-message');
  }
  async match(){
-  const e=[...this.sessions].filter(([,s])=>s.status==='waiting'&&!s.played&&Date.now()-s.lastSeen<PARAMS.waitingTimeoutMs).sort((a,b)=>a[1].queuedAt-b[1].queuedAt);
+  const e=[...this.sessions].filter(([,s])=>s.status==='waiting'&&!s.played&&Date.now()-s.lastSeen<this.params().waitingTimeoutMs).sort((a,b)=>a[1].queuedAt-b[1].queuedAt);
   while(e.length>1){
    const a=e.shift(),i=e.findIndex(([,s])=>s.ruleVersion===a[1].ruleVersion&&s.tier===a[1].tier);if(i<0)continue;
    const b=e.splice(i,1)[0],roomId='CX_'+crypto.randomUUID(),words=new Uint32Array(1);do{crypto.getRandomValues(words);}while(!words[0]);
-   const now=Date.now(),room={roomId,matchSeed:words[0],createdAt:now,preStartAt:now,startAt:null,startPreTick:null,startAuthorized:false,tier:a[1].tier,probeEvidence:{blue:a[1].probeRows||[],red:b[1].probeRows||[]},relaySeq:{blue:{seq:0,tick:0},red:{seq:0,tick:0}},relayEvidence:{},battleJoined:{blue:false,red:false},setup:{blue:null,red:null},commitTicks:{blue:null,red:null},verify:{init:{},initConfirmed:false,confirmedTick:-1,pending:{blue:{},red:{}},ends:{},lastAdvancedAt:now}};
+   const now=Date.now(),room={roomId,matchSeed:words[0],createdAt:now,preStartAt:now,startAt:null,startPreTick:null,startAuthorized:false,tier:a[1].tier,probeEvidence:{blue:a[1].probeRows||[],red:b[1].probeRows||[]},relaySeq:{blue:{seq:0,tick:0},red:{seq:0,tick:0}},relayEvidence:{},battleJoined:{blue:false,red:false},setup:{blue:null,red:null},commitTicks:{blue:null,red:null},verify:{init:{},initConfirmed:false,confirmedTick:-1,pending:{blue:{},red:{}},ends:{},lastAdvancedAt:now},params:{...this.activeConfig.params},configRevision:this.activeConfig.revision};
    room.players={blue:a[1].playerId,red:b[1].playerId};
    await this.ctx.storage.put(ROOM_PREFIX+roomId,room);
    for(const [[ws,s],team]of [[a,'blue'],[b,'red']])this.setSession(ws,{...s,status:'matched',played:true,roomId,team,lastSeen:now,progress:null,lastHbAckAt:null,hbAckCount:0,hbChallenge:null});
-   for(const [[ws],team]of [[a,'blue'],[b,'red']])this.send(ws,{op:'match_found',roomId,team,matchSeed:room.matchSeed,playerId:team==='blue'?room.players.blue:room.players.red,serverNow:now,preStartAt:room.preStartAt,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:PARAMS});
+   for(const [[ws],team]of [[a,'blue'],[b,'red']])this.send(ws,{op:'match_found',roomId,team,matchSeed:room.matchSeed,playerId:team==='blue'?room.players.blue:room.players.red,serverNow:now,preStartAt:room.preStartAt,wireProtocol:WIRE,simulationProtocol:CORE,tickRate:30,parameters:room.params,configRevision:room.configRevision});
   }
  }
  peer(roomId,team,p){let ok=false;for(const [ws,s]of this.sessions)if(s.status==='matched'&&s.roomId===roomId&&s.team!==team)ok=this.send(ws,p)||ok;return ok;}
@@ -375,9 +470,9 @@ export class CXMatchHub extends DurableObject {
  alarm(){const t=this.serial.then(async()=>{
   const now=Date.now();
   for(const [ws,s]of [...this.sessions]){
-   if(s.status==='matched'&&(now-s.lastSeen>=PARAMS.connectionTimeoutMs||(s.hbChallenge&&now-s.hbChallenge.sentAt>=PARAMS.heartbeatAckTimeoutMs))){const r=await this.ctx.storage.get(ROOM_PREFIX+s.roomId);if(r)await this.beginDisconnect(r,s.team,now-s.lastSeen>=PARAMS.connectionTimeoutMs?'heartbeat-timeout':'heartbeat-downlink-timeout');}
-   else if(s.status==='waiting'&&now-s.lastSeen>=PARAMS.waitingTimeoutMs){this.send(ws,{op:'queue_expired'});this.retire(ws);}
-   else if(s.status==='probing'&&now-s.probeStartedAt>=PARAMS.probeTimeoutMs){this.error(ws,'clock-probe-timeout');this.retire(ws);}
+   if(s.status==='matched'){const r=await this.ctx.storage.get(ROOM_PREFIX+s.roomId);if(r&&(now-s.lastSeen>=this.params(r).connectionTimeoutMs||(s.hbChallenge&&now-s.hbChallenge.sentAt>=this.params(r).heartbeatAckTimeoutMs)))await this.beginDisconnect(r,s.team,now-s.lastSeen>=this.params(r).connectionTimeoutMs?'heartbeat-timeout':'heartbeat-downlink-timeout');}
+   else if(s.status==='waiting'&&now-s.lastSeen>=this.params().waitingTimeoutMs){this.send(ws,{op:'queue_expired'});this.retire(ws);}
+   else if(s.status==='probing'&&now-s.probeStartedAt>=this.params().probeTimeoutMs){this.error(ws,'clock-probe-timeout');this.retire(ws);}
   }
   const rows=await this.ctx.storage.list({prefix:ROOM_PREFIX});
   for(const r of rows.values()){
