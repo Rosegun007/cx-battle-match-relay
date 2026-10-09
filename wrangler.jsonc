@@ -17,7 +17,16 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["CXMatchHub"]
+      "new_sqlite_classes": [
+        "CXMatchHub"
+      ]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "CX_PLAYERS_DB",
+      "database_name": "cx-battle-players",
+      "database_id": "a53b5191-558e-41b5-9f36-738ec47fe76c"
     }
   ]
 }
